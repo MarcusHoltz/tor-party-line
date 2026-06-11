@@ -388,7 +388,7 @@ Tune any of these in the [Reference](#-reference) tables.
 
 - Push-to-talk **auto-stops at `MAX_PTT_SECONDS`** (default 120 s) even if you keep holding — release and press again to continue. A clip over the size cap shows **`too long`** instead of sending. 
 
-- Text messages are length-capped, and on a group call the relay **rate-limits each caller** (default 15 messages/s), so holding a key down or pasting a wall of text won't flood or mute the room — the excess is silently dropped. 
+- Text messages are length-capped, and on a group call the relay **rate-limits each caller** (default 15 messages), so holding a key down or pasting a wall of text won't flood or mute the room — the excess is silently dropped. 
 
 
 ---
