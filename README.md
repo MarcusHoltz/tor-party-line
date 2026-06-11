@@ -305,6 +305,14 @@ The app holds a partial wakelock via `termux-wake-lock` ([Termux:API](https://gi
 
 ---
 
+
+## I hear a brief pause mid-message on Android
+
+Nothing is wrong. Messages longer than `PTT_CHUNK_SECONDS` (default 10 s) are split into chunks and played back sequentially. On Android/Termux there is a ~300 ms gap between chunks while the media player loads to the next file — the audio resumes exactly where it left off.
+
+
+---
+
 ### Running automated headless deployments
 
 Skip the menu. Pass flags directly. No interactive prompts. Works on Docker and Script.
@@ -901,9 +909,6 @@ No — onion routing hides both ends. (Exception: single-hop mode, off by defaul
 
 **Why push-to-talk instead of a real phone call?**
 Tor latency and bandwidth make full-duplex unreliable. PTT sends a complete clip per transmission, which survives Tor. Expect a few seconds of end-to-end latency — that's Tor, not the app.
-
-**I hear a brief pause mid-message on Android — is something wrong?**
-No. Messages longer than `PTT_CHUNK_SECONDS` (default 10 s) are split into chunks and played back sequentially. On Android/Termux there is a ~300 ms gap between chunks while the media player loads the next file. This is expected — the audio resumes exactly where it left off.
 
 **Do I need an account or phone number?**
 None. Your identity is your `.onion` address; authentication is the shared secret.
