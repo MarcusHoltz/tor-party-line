@@ -14,7 +14,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
     fi
-    echo "This script requires bash. Run:  bash partyline.sh" >&2
+    echo "This script requires bash. Run:  bash tor-party-line.sh" >&2
     exit 1
 fi
 
@@ -22,7 +22,7 @@ fi
 # CONFIGURATION
 #=============================================================================
 APP_NAME="Tor Party Line"
-VERSION="2.0.0"
+VERSION="2.1.0"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
 # ─── Docker mode detection ────────────────────────────────────────────────────
@@ -80,6 +80,10 @@ HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-20}"    # client: send PING every N s 
                                                   # keep well below RELAY_IDLE_TIMEOUT; RELAY_IDLE_TIMEOUT must stay > MAX_PTT_SECONDS + this value
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-180}"           # client: treat no inbound traffic for N s as a dropped connection (must exceed the relay's ~10s GROUP beacon)
 RECONNECT_ATTEMPTS="${RECONNECT_ATTEMPTS:-3}"     # client: re-dial this many times after a detected drop before giving up to the menu
+DIAL_ATTEMPTS="${DIAL_ATTEMPTS:-3}"              # client: retry initial dial this many times before giving up
+DIAL_TIMEOUT="${DIAL_TIMEOUT:-60}"               # client: per-attempt timeout in seconds for SOCKS connect (Tor circuit
+                                                 # build typically takes 15-60 s; 60 s gives headroom for slow circuits
+                                                 # without making the user wait on a dead route)
 OPUS_BITRATE="${OPUS_BITRATE:-16}"       # kbps — good balance of quality and bandwidth for Tor
 OPUS_FRAMESIZE=60     # ms
 SAMPLE_RATE=8000      # Hz
@@ -96,7 +100,12 @@ TOR_CONTROL_PORT=9051 # Tor control port (used when SHOW_CIRCUIT=1)
 EXCLUDE_NODES="${EXCLUDE_NODES:-}"       # Tor ExcludeNodes (comma-separated country codes, e.g. {US},{GB})
 HMAC_AUTH="${HMAC_AUTH:-1}"              # HMAC-sign all protocol messages (on by default)
 SINGLE_HOP="${SINGLE_HOP:-0}"            # Single-hop hidden service (off by default, sacrifices server anonymity for speed)
+
+NORMALIZE_PLAYBACK="${NORMALIZE_PLAYBACK:-0}"  # Normalize received audio volume (0=off, 1=on)
+FULL_DUPLEX="${FULL_DUPLEX:-0}"                # Full-duplex audio (0=PTT, 1=full-duplex; requires SINGLE_HOP=1)
+FD_ENGINE_PY="${FD_ENGINE_PY:-$DATA_DIR/run/fullduplex_engine.py}" # emitted from embedded heredoc
 OVERWRITE_DELETE=0    # Overwrite temp files with random data before deletion (off by default)
+START_MUTED="${START_MUTED:-1}"  # Start full-duplex sessions muted (1=muted, 0=live)
 ALSA_DEVICE="${ALSA_DEVICE:-}"   # Override ALSA device; preserves env var if set by docker-compose
 ALSA_PLAY_DEVICE="${ALSA_PLAY_DEVICE:-}"  # Override ALSA playback device (preserves env var)
 PULSE_SOURCE="${PULSE_SOURCE:-}" # PipeWire/PulseAudio capture device name; empty = system default
@@ -317,15 +326,18 @@ kill_bg_processes() {
         wait $pids 2>/dev/null || true
     fi
 
-    # Kill stored PIDs
+    # Kill stored PIDs — only this process's own (PID_DIR is shared across
+    # every concurrent instance using the same DATA_DIR; a bare "*.pid" glob
+    # would kill another instance's live socat/recv_loop just because this
+    # instance happened to exit).
     if [ -d "$PID_DIR" ]; then
-        for pidfile in "$PID_DIR"/*.pid; do
+        for pidfile in "$PID_DIR"/*"_$$.pid"; do
             [ -f "$pidfile" ] || continue
             local pid
             pid=$(cat "$pidfile" 2>/dev/null) || continue
             kill "$pid" 2>/dev/null || true
         done
-        rm -f "$PID_DIR"/*.pid 2>/dev/null || true
+        rm -f "$PID_DIR"/*"_$$.pid" 2>/dev/null || true
     fi
 
     # Kill our Tor instance if running (script mode only — Docker manages Tor via entrypoint.sh)
@@ -338,7 +350,7 @@ kill_bg_processes() {
 save_pid() {
     local name="$1" pid="$2"
     mkdir -p "$PID_DIR"
-    echo "$pid" > "$PID_DIR/${name}.pid"
+    echo "$pid" > "$PID_DIR/${name}_$$.pid"
 }
 
 log_info() {
@@ -391,6 +403,8 @@ load_config() {
                 HEARTBEAT_INTERVAL) HEARTBEAT_INTERVAL="$_lc_val" ;;
                 CLIENT_TIMEOUT)     CLIENT_TIMEOUT="$_lc_val" ;;
                 RECONNECT_ATTEMPTS) RECONNECT_ATTEMPTS="$_lc_val" ;;
+                DIAL_ATTEMPTS)      DIAL_ATTEMPTS="$_lc_val" ;;
+                DIAL_TIMEOUT)       DIAL_TIMEOUT="$_lc_val" ;;
                 OPUS_BITRATE)       OPUS_BITRATE="$_lc_val" ;;
                 OPUS_FRAMESIZE)     OPUS_FRAMESIZE="$_lc_val" ;;
                 PTT_KEY)            PTT_KEY="$_lc_val" ;;
@@ -403,6 +417,10 @@ load_config() {
                 EXCLUDE_NODES)      EXCLUDE_NODES="$_lc_val" ;;
                 HMAC_AUTH)          HMAC_AUTH="$_lc_val" ;;
                 SINGLE_HOP)         SINGLE_HOP="$_lc_val" ;;
+                PTT_CHIME)          ;; # removed, kept for config-file compat
+                NORMALIZE_PLAYBACK) NORMALIZE_PLAYBACK="$_lc_val" ;;
+                FULL_DUPLEX)        FULL_DUPLEX="$_lc_val" ;;
+                START_MUTED)        START_MUTED="$_lc_val" ;;
                 OVERWRITE_DELETE)   OVERWRITE_DELETE="$_lc_val" ;;
                 ALSA_DEVICE)        ALSA_DEVICE="$_lc_val" ;;
                 ALSA_PLAY_DEVICE)   ALSA_PLAY_DEVICE="$_lc_val" ;;
@@ -474,6 +492,592 @@ load_config() {
     fi
 }
 
+# ─── Full-duplex engine deployment (embedded heredoc, one-file constraint) ───
+write_fullduplex_engine() {
+    mkdir -p "$(dirname "$FD_ENGINE_PY")"
+    local staged="${FD_ENGINE_PY}.$$"
+    _emit_fullduplex_engine "$staged" || { rm -f "$staged"; return 1; }
+    if ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+            "$staged" 2>/dev/null; then
+        log_err "Full-duplex engine is not valid Python (embedded heredoc corrupt)"
+        rm -f "$staged"
+        return 1
+    fi
+    mv -f "$staged" "$FD_ENGINE_PY" || { rm -f "$staged"; return 1; }
+    return 0
+}
+
+_emit_fullduplex_engine() {
+    cat > "$1" << 'FULLDUPLEX_ENGINE_PY_EOF'
+#!/usr/bin/env python3
+"""
+Partyline full-duplex audio engine.
+Pipe-based bidirectional voice streaming with per-frame encryption.
+
+Launched by in_call_session when FULL_DUPLEX=1. Reads/writes the
+existing FIFO pipe pair. Non-audio protocol lines are forwarded to
+stdout so the calling shell can handle them.
+
+Dependencies: Python 3, libopus (system package).
+No pip packages. All bindings via ctypes.
+"""
+
+import sys
+import os
+import time
+import struct
+import hashlib
+import hmac as hmac_mod
+import ctypes
+import ctypes.util
+import subprocess
+import threading
+import signal
+import base64
+
+
+# ─── Opus codec via ctypes ───────────────────────────────────────
+
+class OpusCodec:
+    APP_VOIP = 2048
+    SET_BITRATE = 4002
+    SET_VBR = 4006
+    SET_FEC = 4012
+    SET_DTX = 4016
+    SET_SIGNAL = 4024
+    SIGNAL_VOICE = 3001
+
+    def __init__(self, sample_rate=8000, channels=1, bitrate=16000):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.bitrate = bitrate
+        self.lib = None
+        self.encoder = None
+        self.decoder = None
+        self.available = False
+        self._load()
+
+    def _load(self):
+        paths = [ctypes.util.find_library("opus")]
+        if "PREFIX" in os.environ:
+            paths.insert(0, os.path.join(
+                os.environ["PREFIX"], "lib", "libopus.so"))
+        paths += [
+            "/usr/lib/libopus.so.0",
+            "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+            "/usr/lib/aarch64-linux-gnu/libopus.so.0",
+            "/usr/lib/arm-linux-gnueabihf/libopus.so.0",
+            "/data/data/com.termux/files/usr/lib/libopus.so",
+            "/data/data/com.termux/files/usr/lib/libopus.so.0",
+            "/opt/homebrew/lib/libopus.dylib",
+            "/opt/homebrew/lib/libopus.0.dylib",
+            "/usr/local/lib/libopus.dylib",
+        ]
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    self.lib = ctypes.CDLL(p)
+                    break
+                except Exception:
+                    pass
+        if not self.lib:
+            for name in ["opus", "libopus.so.0", "libopus.dylib"]:
+                try:
+                    self.lib = ctypes.CDLL(name)
+                    break
+                except Exception:
+                    pass
+        if not self.lib:
+            return
+
+        try:
+            L = self.lib
+            L.opus_encoder_create.restype = ctypes.c_void_p
+            L.opus_encoder_create.argtypes = [
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int)]
+            L.opus_encoder_ctl.restype = ctypes.c_int
+            L.opus_encoder_ctl.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            L.opus_encode.restype = ctypes.c_int
+            L.opus_encode.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int32]
+            L.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+            L.opus_decoder_create.restype = ctypes.c_void_p
+            L.opus_decoder_create.argtypes = [
+                ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int)]
+            L.opus_decode.restype = ctypes.c_int
+            L.opus_decode.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int16), ctypes.c_int,
+                ctypes.c_int]
+            L.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+
+            err = ctypes.c_int()
+            self.encoder = L.opus_encoder_create(
+                self.sample_rate, self.channels,
+                self.APP_VOIP, ctypes.byref(err))
+            if err.value != 0 or not self.encoder:
+                return
+            for req, val in [
+                (self.SET_BITRATE, self.bitrate),
+                (self.SET_VBR, 1),
+                (self.SET_FEC, 1),
+                (self.SET_DTX, 1),
+                (self.SET_SIGNAL, self.SIGNAL_VOICE),
+            ]:
+                L.opus_encoder_ctl(
+                    self.encoder, req, ctypes.c_int(val))
+            self.decoder = L.opus_decoder_create(
+                self.sample_rate, self.channels, ctypes.byref(err))
+            if self.encoder and self.decoder:
+                self.available = True
+        except Exception:
+            self.available = False
+
+    def encode(self, pcm_bytes, frame_size):
+        if not self.available:
+            return pcm_bytes
+        pcm = (ctypes.c_int16 * frame_size).from_buffer_copy(pcm_bytes)
+        out = ctypes.create_string_buffer(1275)
+        n = self.lib.opus_encode(
+            self.encoder, pcm, frame_size, out, 1275)
+        return out.raw[:n] if n > 0 else b""
+
+    def decode(self, opus_bytes, frame_size):
+        if not self.available:
+            return opus_bytes
+        out = (ctypes.c_int16 * frame_size)()
+        n = self.lib.opus_decode(
+            self.decoder, opus_bytes, len(opus_bytes),
+            out, frame_size, 0)
+        if n > 0:
+            return bytes(out)[:n * 2]
+        return b"\x00" * (frame_size * 2)
+
+    def close(self):
+        if not self.lib:
+            return
+        if self.encoder:
+            try:
+                self.lib.opus_encoder_destroy(self.encoder)
+            except Exception:
+                pass
+            self.encoder = None
+        if self.decoder:
+            try:
+                self.lib.opus_decoder_destroy(self.decoder)
+            except Exception:
+                pass
+            self.decoder = None
+
+
+# ─── Per-frame crypto ────────────────────────────────────────────
+
+class CryptoEngine:
+    """SHA-256-CTR + HMAC-SHA256 with monotonic replay protection.
+
+    Wire format per frame:
+      [8-byte seq] [ciphertext] [16-byte HMAC tag]
+    Total overhead: 24 bytes.
+    """
+
+    def __init__(self, shared_secret):
+        raw = shared_secret.encode("utf-8")
+        salt = b"partyline-fullduplex-v1"
+        derived = hashlib.pbkdf2_hmac(
+            "sha256", raw, salt, 20000, dklen=64)
+        self.enc_key = derived[:32]
+        self.hmac_key = derived[32:]
+        self.tx_seq = 0
+        self.rx_seq_max = -1
+
+    def _keystream(self, key, nonce, length):
+        ks = bytearray()
+        ctr = 0
+        while len(ks) < length:
+            ks.extend(hashlib.sha256(
+                key + nonce + struct.pack(">Q", ctr)
+            ).digest())
+            ctr += 1
+        return bytes(ks[:length])
+
+    def encrypt(self, plaintext):
+        self.tx_seq += 1
+        seq = struct.pack(">Q", self.tx_seq)
+        ks = self._keystream(self.enc_key, seq, len(plaintext))
+        ct = bytes(a ^ b for a, b in zip(plaintext, ks))
+        tag = hmac_mod.new(
+            self.hmac_key, seq + ct, hashlib.sha256
+        ).digest()[:16]
+        return seq + ct + tag
+
+    def decrypt(self, packet):
+        if len(packet) < 24:
+            return None
+        seq_bytes = packet[:8]
+        tag = packet[-16:]
+        ct = packet[8:-16]
+        expected = hmac_mod.new(
+            self.hmac_key, seq_bytes + ct, hashlib.sha256
+        ).digest()[:16]
+        if not hmac_mod.compare_digest(tag, expected):
+            return None
+        seq_val = struct.unpack(">Q", seq_bytes)[0]
+        if seq_val <= self.rx_seq_max:
+            return None
+        self.rx_seq_max = seq_val
+        ks = self._keystream(self.enc_key, seq_bytes, len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks))
+
+
+# ─── Platform audio helpers ──────────────────────────────────────
+
+def _has_bin(name):
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        fp = os.path.join(d, name)
+        if os.path.isfile(fp) and os.access(fp, os.X_OK):
+            return True
+    return False
+
+
+IS_TERMUX = os.path.isdir("/data/data/com.termux")
+IS_MACOS = sys.platform == "darwin"
+
+
+def spawn_recorder(sample_rate):
+    alsa_dev = os.environ.get("ALSA_DEVICE", "")
+    pulse_src = os.environ.get("PULSE_SOURCE", "")
+    cmd = None
+
+    if IS_MACOS:
+        cmd = ["rec", "-q", "-t", "raw", "-r", str(sample_rate),
+               "-e", "signed", "-b", "16", "-c", "1", "-"]
+    elif IS_TERMUX:
+        for tool in ("pacat", "parec"):
+            if _has_bin(tool):
+                cmd = [tool]
+                if tool == "pacat":
+                    cmd.append("-r")
+                cmd += ["--format=s16le", "--channels=1",
+                        "--rate=%d" % sample_rate,
+                        "--latency-msec=40"]
+                break
+    else:
+        if not alsa_dev and _has_bin("parecord"):
+            cmd = ["parecord", "--latency-msec=50",
+                   "--rate=%d" % sample_rate,
+                   "--channels=1", "--format=s16le", "--raw"]
+            if pulse_src:
+                cmd += ["-d", pulse_src]
+        else:
+            cmd = ["arecord"]
+            if alsa_dev:
+                cmd += ["-D", alsa_dev]
+            cmd += ["-f", "S16_LE", "-r", str(sample_rate),
+                    "-c", "1", "-t", "raw", "-q", "-"]
+    if not cmd:
+        return None
+    try:
+        return subprocess.Popen(
+            cmd, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
+    except Exception:
+        return None
+
+
+def spawn_player(sample_rate):
+    alsa_play = os.environ.get("ALSA_PLAY_DEVICE", "")
+    pulse_sink = os.environ.get("PULSE_SINK", "")
+    cmd = None
+
+    if IS_MACOS or IS_TERMUX:
+        if _has_bin("play"):
+            cmd = ["play", "-q", "-t", "raw", "-r",
+                   str(sample_rate), "-e", "signed",
+                   "-b", "16", "-c", "1", "-"]
+        elif _has_bin("pacat"):
+            cmd = ["pacat", "-p", "--format=s16le",
+                   "--channels=1",
+                   "--rate=%d" % sample_rate,
+                   "--latency-msec=50"]
+    else:
+        if not alsa_play and _has_bin("pacat"):
+            cmd = ["pacat", "-p", "--format=s16le",
+                   "--channels=1",
+                   "--rate=%d" % sample_rate,
+                   "--latency-msec=50"]
+            if pulse_sink:
+                cmd += ["-d", pulse_sink]
+        else:
+            cmd = ["aplay"]
+            if alsa_play:
+                cmd += ["-D", alsa_play]
+            cmd += ["-f", "S16_LE", "-r", str(sample_rate),
+                    "-c", "1", "-t", "raw", "-q", "-"]
+    if not cmd:
+        return None
+    try:
+        return subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0)
+    except Exception:
+        return None
+
+
+# ─── Engine ──────────────────────────────────────────────────────
+
+class FullDuplexEngine:
+    def __init__(self, recv_pipe, send_pipe, secret,
+                 sample_rate=8000, bitrate=16000, start_muted=False):
+        self.recv_pipe = recv_pipe
+        self.send_pipe = send_pipe
+        self.sample_rate = sample_rate
+        self.frame_ms = 60
+        self.frame_size = int(sample_rate * self.frame_ms / 1000)
+        self.pcm_bytes = self.frame_size * 2
+
+        self.codec = OpusCodec(sample_rate, 1, bitrate)
+        self.crypto = CryptoEngine(secret)
+
+        self.running = False
+        self.muted = start_muted
+
+        self.jitter = []
+        self.jitter_lock = threading.Lock()
+        self.jitter_max = 5
+
+        self.rec_proc = None
+        self.play_proc = None
+        self.send_fd = None
+        self.recv_file = None
+
+    def run(self):
+        if not self.codec.available:
+            sys.stderr.write(
+                "fd_engine: libopus not found; "
+                "full-duplex unavailable\n")
+            return 1
+
+        self.running = True
+
+        self.send_fd = os.open(self.send_pipe, os.O_WRONLY)
+        self.recv_file = open(
+            os.open(self.recv_pipe, os.O_RDONLY), "r",
+            encoding="utf-8", errors="replace")
+
+        self.rec_proc = spawn_recorder(self.sample_rate)
+        self.play_proc = spawn_player(self.sample_rate)
+
+        threads = [
+            threading.Thread(
+                target=self._capture_loop, daemon=True,
+                name="fd-capture"),
+            threading.Thread(
+                target=self._receive_loop, daemon=True,
+                name="fd-receive"),
+            threading.Thread(
+                target=self._playback_loop, daemon=True,
+                name="fd-playback"),
+        ]
+        for t in threads:
+            t.start()
+
+        try:
+            while self.running:
+                time.sleep(0.1)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+
+        self.running = False
+        self._cleanup()
+        return 0
+
+    # ── capture thread ──
+
+    def _capture_loop(self):
+        silence = b"\x00" * self.pcm_bytes
+        while self.running:
+            pcm = self._read_mic()
+            if not pcm:
+                continue
+            if self.muted:
+                pcm = silence
+
+            opus = self.codec.encode(pcm, self.frame_size)
+            if not opus:
+                continue
+
+            encrypted = self.crypto.encrypt(opus)
+            b64 = base64.b64encode(encrypted).decode("ascii")
+            line = ("FDAUDIO:" + b64 + "\n").encode("utf-8")
+
+            try:
+                os.write(self.send_fd, line)
+            except (OSError, BrokenPipeError):
+                self.running = False
+                break
+
+    def _read_mic(self):
+        if not self.rec_proc or not self.rec_proc.stdout:
+            time.sleep(self.frame_ms / 1000.0)
+            return b"\x00" * self.pcm_bytes
+
+        data = bytearray()
+        remain = self.pcm_bytes
+        while remain > 0 and self.running:
+            try:
+                chunk = self.rec_proc.stdout.read(remain)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                remain -= len(chunk)
+            except Exception:
+                break
+
+        if len(data) < self.pcm_bytes:
+            data.extend(b"\x00" * (self.pcm_bytes - len(data)))
+        return bytes(data)
+
+    # ── receive thread ──
+
+    def _receive_loop(self):
+        while self.running:
+            try:
+                line = self.recv_file.readline()
+            except Exception:
+                break
+            if not line:
+                self.running = False
+                break
+
+            line = line.rstrip("\n\r")
+            if not line:
+                continue
+
+            if line.startswith("FDAUDIO:"):
+                b64 = line[8:]
+                try:
+                    encrypted = base64.b64decode(b64)
+                except Exception:
+                    continue
+                opus = self.crypto.decrypt(encrypted)
+                if opus is None:
+                    continue
+                pcm = self.codec.decode(opus, self.frame_size)
+                if pcm:
+                    with self.jitter_lock:
+                        if len(self.jitter) >= self.jitter_max:
+                            self.jitter.pop(0)
+                        self.jitter.append(pcm)
+            else:
+                try:
+                    sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+    # ── playback thread ──
+
+    def _playback_loop(self):
+        frame_sec = self.frame_ms / 1000.0
+        prefill = 3
+        filled = False
+
+        while self.running:
+            if not filled:
+                with self.jitter_lock:
+                    if len(self.jitter) >= prefill:
+                        filled = True
+                if not filled:
+                    time.sleep(frame_sec * 0.25)
+                    continue
+
+            pcm = None
+            with self.jitter_lock:
+                if self.jitter:
+                    pcm = self.jitter.pop(0)
+                elif filled:
+                    filled = False
+
+            if pcm and self.play_proc and self.play_proc.stdin:
+                try:
+                    self.play_proc.stdin.write(pcm)
+                    self.play_proc.stdin.flush()
+                except Exception:
+                    pass
+            else:
+                time.sleep(frame_sec * 0.5)
+
+    # ── teardown ──
+
+    def _cleanup(self):
+        for proc in (self.rec_proc, self.play_proc):
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        if self.send_fd is not None:
+            try:
+                os.close(self.send_fd)
+            except Exception:
+                pass
+        if self.recv_file:
+            try:
+                self.recv_file.close()
+            except Exception:
+                pass
+        self.codec.close()
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write(
+            "Usage: FD_SECRET=... fd_engine RECV_PIPE SEND_PIPE"
+            " [SAMPLE_RATE] [BITRATE_BPS] [START_MUTED]\n")
+        return 1
+
+    recv_pipe = sys.argv[1]
+    send_pipe = sys.argv[2]
+    secret = os.environ.get("FD_SECRET", "")
+    if not secret:
+        sys.stderr.write("fd_engine: FD_SECRET not set\n")
+        return 1
+    sample_rate = int(sys.argv[3]) if len(sys.argv) > 3 else 8000
+    bitrate = int(sys.argv[4]) if len(sys.argv) > 4 else 16000
+    start_muted = len(sys.argv) > 5 and sys.argv[5] == "1"
+
+    engine = FullDuplexEngine(
+        recv_pipe, send_pipe, secret,
+        sample_rate, bitrate, start_muted=start_muted)
+
+    def on_stop(signum, frame):
+        engine.running = False
+
+    def on_mute(signum, frame):
+        engine.muted = not engine.muted
+        state = "muted" if engine.muted else "live"
+        sys.stderr.write("fd_engine: mic %s\n" % state)
+
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    signal.signal(signal.SIGUSR1, on_mute)
+
+    return engine.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+FULLDUPLEX_ENGINE_PY_EOF
+}
+
 # Config is intentionally plaintext — it contains ports and preferences, not secrets.
 # The shared secret lives separately in $SECRET_FILE, optionally encrypted with a passphrase.
 save_config() {
@@ -493,6 +1097,8 @@ RELAY_IDLE_TIMEOUT=$RELAY_IDLE_TIMEOUT
 HEARTBEAT_INTERVAL=$HEARTBEAT_INTERVAL
 CLIENT_TIMEOUT=$CLIENT_TIMEOUT
 RECONNECT_ATTEMPTS=$RECONNECT_ATTEMPTS
+DIAL_ATTEMPTS=$DIAL_ATTEMPTS
+DIAL_TIMEOUT=$DIAL_TIMEOUT
 OPUS_BITRATE=$OPUS_BITRATE
 OPUS_FRAMESIZE=$OPUS_FRAMESIZE
 PTT_KEY="$PTT_KEY"
@@ -505,6 +1111,10 @@ SHOW_CIRCUIT=$SHOW_CIRCUIT
 EXCLUDE_NODES="$EXCLUDE_NODES"
 HMAC_AUTH=$HMAC_AUTH
 SINGLE_HOP=$SINGLE_HOP
+
+NORMALIZE_PLAYBACK=$NORMALIZE_PLAYBACK
+FULL_DUPLEX=$FULL_DUPLEX
+START_MUTED=$START_MUTED
 OVERWRITE_DELETE=$OVERWRITE_DELETE
 ALSA_DEVICE="${ALSA_DEVICE:-}"
 ALSA_PLAY_DEVICE="${ALSA_PLAY_DEVICE:-}"
@@ -552,6 +1162,17 @@ pm_pkglist() {
         brew)   echo "tor opus-tools socat openssl ffmpeg" ;;
         apt|dnf) echo "tor opus-tools socat openssl alsa-utils pulseaudio-utils" ;;
         pacman) echo "tor opus-tools socat openssl alsa-utils libpulse" ;;
+    esac
+}
+
+pm_pkglist_fullduplex() {
+    _pm_init
+    case "$PM" in
+        termux) echo "python" ;;
+        brew)   echo "python3 opus" ;;
+        apt)    echo "python3 libopus0" ;;
+        dnf)    echo "python3 opus" ;;
+        pacman) echo "python opus" ;;
     esac
 }
 
@@ -617,7 +1238,7 @@ pm_remove() {
 # it for both directions and never fall to ALSA-direct.
 #
 # Override policy: an ALSA device provided via the ENVIRONMENT (script mode:
-# `ALSA_DEVICE=… ./partyline.sh`, or Docker/.env) is a deliberate hard override
+# `ALSA_DEVICE=… ./tor-party-line.sh`, or Docker/.env) is a deliberate hard override
 # and forces the ALSA backend. A device that only comes from the saved config is
 # a soft preference — the sound server wins when it's actually delivering audio,
 # so a stale saved value never strands a desktop on ALSA.
@@ -799,6 +1420,15 @@ install_deps() {
         all_deps=(tor opusenc opusdec socat openssl parecord paplay arecord aplay)
     fi
 
+    # Full-duplex (live two-way audio) needs python3 + libopus.
+    # Half-duplex (walkie-talkie / PTT) is pure shell, no Python.
+    local _install_fullduplex=0
+    echo ""
+    if confirm_no "  ${BOLD}Enable full-duplex audio? Requires python3. [y/N]: ${NC}"; then
+        _install_fullduplex=1
+        all_deps+=(python3)
+    fi
+
     # Check which deps are missing
     for dep in "${all_deps[@]}"; do
         if check_dep "$dep"; then
@@ -840,7 +1470,9 @@ install_deps() {
     # installing. We record only the ones we actually add so uninstall removes
     # what this script put there — nothing pre-existing.
     local _pre_existing="" _pkg
-    for _pkg in $(pm_pkglist); do
+    local _all_pkgs; _all_pkgs=$(pm_pkglist)
+    [ "$_install_fullduplex" -eq 1 ] && _all_pkgs="$_all_pkgs $(pm_pkglist_fullduplex)"
+    for _pkg in $_all_pkgs; do
         pm_query "$_pkg" && _pre_existing="$_pre_existing $_pkg"
     done
 
@@ -886,7 +1518,7 @@ install_deps() {
 
     [ "$PM" = "brew" ] && log_info "Installing dependencies via Homebrew..."
     [ "$PM" = "brew" ] && [ -n "$BREW_ARCH" ] && log_info "Running brew under arm64 (Rosetta shell detected)"
-    pm_install $(pm_pkglist)
+    pm_install $_all_pkgs
 
     if [ $IS_TERMUX -eq 1 ]; then
         echo -e "\n${YELLOW}${BOLD}NOTE:${NC} You must also install the ${BOLD}Termux:API${NC} app from F-Droid"
@@ -912,7 +1544,7 @@ install_deps() {
         mkdir -p "$DATA_DIR" 2>/dev/null || true
         if [ -w "$DATA_DIR" ]; then
             local _new_pkgs=() _skipped=()
-            for _pkg in $(pm_pkglist); do
+            for _pkg in $_all_pkgs; do
                 if [[ " $_pre_existing " == *" $_pkg "* ]]; then
                     _skipped+=("$_pkg")   # was already on the system — don't record
                 else
@@ -1044,7 +1676,7 @@ uninstall_all() {
     fi
 
     echo -e "\n${GREEN}${BOLD}Uninstall complete.${NC}"
-    echo -e "  ${DIM}The script itself (partyline.sh) and the project directory were not touched.${NC}\n"
+    echo -e "  ${DIM}The script itself (tor-party-line.sh) and the project directory were not touched.${NC}\n"
 }
 
 #=============================================================================
@@ -1147,7 +1779,7 @@ install_snowflake() {
         echo -e "  ${YELLOW}┌─────────────────────────────────────────────────────────┐${NC}"
         echo -e "  ${YELLOW}│ Snowflake is not supported in Docker mode                │${NC}"
         echo -e "  ${YELLOW}│ snowflake-client is not available in Alpine Linux repos   │${NC}"
-        echo -e "  ${YELLOW}│ To use Snowflake: run partyline.sh directly on your host  │${NC}"
+        echo -e "  ${YELLOW}│ To use Snowflake: run tor-party-line.sh directly on your host  │${NC}"
         echo -e "  ${YELLOW}└─────────────────────────────────────────────────────────┘${NC}"
         echo ""
         return 0
@@ -1266,9 +1898,7 @@ _tor_wait_bootstrap() {
 
 start_tor() {
     if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
-        # Tor was launched in the background at startup; it may still be
-        # bootstrapping, so wait before returning to the caller.
-        log_info "Tor is already running (PID $TOR_PID)"
+        :
     else
         log_info "Starting Tor..."
         if [ ! -d "$TOR_DIR/data" ] && [ ! -f "$ONION_FILE" ]; then
@@ -1467,15 +2097,20 @@ generate_vanity_onion() {
         return
     fi
 
-    # Install the chosen key material into Tor's hidden-service directory
+    # Install the chosen key material into Tor's hidden-service directory.
+    # In Docker the existing files are owned by debian-tor; partyline can't
+    # overwrite them directly but can unlink them (directory is group-writable).
     mkdir -p "$TOR_DIR/hidden_service"
+    rm -f "$TOR_DIR/hidden_service/hostname" \
+          "$TOR_DIR/hidden_service/hs_ed25519_secret_key" \
+          "$TOR_DIR/hidden_service/hs_ed25519_public_key"
     cp "$selected/hostname" \
        "$selected/hs_ed25519_secret_key" \
        "$selected/hs_ed25519_public_key" \
        "$TOR_DIR/hidden_service/"
     chmod 600 "$TOR_DIR/hidden_service/hs_ed25519_secret_key" \
-              "$TOR_DIR/hidden_service/hs_ed25519_public_key"
-    chmod 700 "$TOR_DIR/hidden_service"
+              "$TOR_DIR/hidden_service/hs_ed25519_public_key" 2>/dev/null || true
+    chmod 700 "$TOR_DIR/hidden_service" 2>/dev/null || true
     chown -R debian-tor:debian-tor "$TOR_DIR/hidden_service" 2>/dev/null || true
     rm -rf "$vanity_dir"
 
@@ -1857,16 +2492,23 @@ proto_send() {
     # audio packet and corrupt it. _lock makes every send atomic w.r.t. the others.
     local _sl="$DATA_DIR/run/send_lock_$$"
     _lock "$_sl"
+    local _out
     if [ "$_hmac" -eq 1 ]; then
         local nonce sig signed_msg
         nonce=$(od -An -N8 -tx1 /dev/urandom); nonce="${nonce//[[:space:]]/}"
         signed_msg="${nonce}:${msg}"
         sig=$(printf '%s' "$signed_msg" | openssl dgst -sha256 -hmac "$SHARED_SECRET" -r 2>/dev/null)
         sig="${sig%% *}"
-        echo "${signed_msg}|${sig}" >&4 2>/dev/null || true
+        _out="${signed_msg}|${sig}"
     else
-        echo "$msg" >&4 2>/dev/null || true
+        _out="$msg"
     fi
+    # Bounded like every other blocking I/O point in the app (decrypt_file,
+    # the relay's own fan-out writes): fd 4 can be open but stalled (a dead
+    # transport whose local socket hasn't closed yet), and an unbounded write
+    # here would hold _sl forever, freezing every future send (PTT, heartbeat)
+    # behind it with no recovery path.
+    _timeout 10 sh -c 'printf "%s\n" "$1" >&4' - "$_out" 2>/dev/null || true
     _unlock "$_sl"
 }
 
@@ -2209,23 +2851,69 @@ ptt_toggle_mode() {
     [ $IS_TERMUX -eq 1 ] || [ "${PTT_TOGGLE_MODE:-0}" -eq 1 ]
 }
 
+ensure_pcm_rms() {
+    command -v pcm_rms >/dev/null 2>&1 && return 0
+    command -v gcc >/dev/null 2>&1 || return 1
+    local _bin="$DATA_DIR/bin"
+    mkdir -p "$_bin" 2>/dev/null || return 1
+    local _src="$_bin/pcm_rms.c"
+    cat > "$_src" << 'PCM_RMS_C_EOF'
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+
+int main(void) {
+    int16_t buf[4096];
+    double sum = 0.0;
+    long count = 0;
+    size_t n;
+    while ((n = fread(buf, sizeof(int16_t), 4096, stdin)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            double s = (double)buf[i];
+            sum += s * s;
+        }
+        count += n;
+    }
+    if (count == 0) { printf("-91.0\n"); return 0; }
+    double rms = sqrt(sum / count);
+    double dbfs = 20.0 * log10(rms / 32768.0);
+    printf("%.1f\n", dbfs);
+    return 0;
+}
+PCM_RMS_C_EOF
+    gcc -O2 -o "$_bin/pcm_rms" "$_src" -lm 2>/dev/null || { rm -f "$_src"; return 1; }
+    rm -f "$_src"
+    export PATH="$_bin:$PATH"
+    return 0
+}
+
 # Play an opus file
 play_chunk() {
     local opus_file="$1"
 
+    local _norm_gain=""
+    if [ "${NORMALIZE_PLAYBACK:-0}" -eq 1 ] && command -v pcm_rms >/dev/null 2>&1; then
+        local _rms
+        _rms=$(opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | pcm_rms)
+        if [ -n "$_rms" ]; then
+            _norm_gain=$(awk -v r="$_rms" \
+                'BEGIN{g=-24-r; if(g>40)g=40; if(g<-40)g=-40;
+                       printf "%d",(g>0?g+0.5:g-0.5)}')
+        fi
+    fi
+
     if [ $IS_TERMUX -eq 1 ]; then
         local _tmp_wav; _tmp_wav="${AUDIO_DIR}/play_$(uid).wav"
-        opusdec --quiet --rate 48000 "$opus_file" "$_tmp_wav" 2>/dev/null || true
+        if [ -n "$_norm_gain" ]; then
+            opusdec --quiet --rate 48000 --gain "$_norm_gain" "$opus_file" "$_tmp_wav" 2>/dev/null || true
+        else
+            opusdec --quiet --rate 48000 "$opus_file" "$_tmp_wav" 2>/dev/null || true
+        fi
         if [ -s "$_tmp_wav" ]; then
             termux-media-player play "$_tmp_wav" >/dev/null 2>&1 || true
-            # termux-media-player returns immediately — poll until playback finishes.
-            # Cap derived from file size: opusdec outputs 48 kHz mono s16le = 96000 B/s.
-            # Allow 15 s of extra headroom beyond the computed audio length.
             local _wav_size; _wav_size=$(file_size "$_tmp_wav"); [ "$_wav_size" -gt 0 ] 2>/dev/null || _wav_size=44
             local _wav_secs=$(( (_wav_size - 44) / 96000 + 1 ))
             local _max_polls=$(( (_wav_secs + 15) * 2 ))
-            # Android can take a moment to transition to "playing"; don't treat the
-            # initial "idle" response as "done" — give it up to 3 s to start.
             local _startup_polls=6
             local _tw=0 _playing=0
             while [ $_tw -lt $_max_polls ]; do
@@ -2241,17 +2929,23 @@ play_chunk() {
         fi
         overwrite_rm "$_tmp_wav"
     elif [ $IS_MACOS -eq 1 ]; then
-        # Decode to a WAV and play through afplay, a native macOS binary that
-        # always exists (no Homebrew/SDL like ffplay) and routes to the system
-        # default output (System Settings → Sound → Output).
         local _wav="$AUDIO_DIR/play_$(uid).wav"
-        opusdec --quiet --rate 48000 "$opus_file" "$_wav" 2>/dev/null || true
+        if [ -n "$_norm_gain" ]; then
+            opusdec --quiet --rate 48000 --gain "$_norm_gain" "$opus_file" "$_wav" 2>/dev/null || true
+        else
+            opusdec --quiet --rate 48000 "$opus_file" "$_wav" 2>/dev/null || true
+        fi
         [ -s "$_wav" ] && afplay "$_wav" 2>/dev/null || true
         overwrite_rm "$_wav"
     else
         detect_audio_backend
-        opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | \
-            _play_raw 48000 || true
+        if [ -n "$_norm_gain" ]; then
+            opusdec --quiet --rate 48000 --gain "$_norm_gain" "$opus_file" - \
+                2>/dev/null | _play_raw 48000 || true
+        else
+            opusdec --quiet --rate 48000 "$opus_file" - 2>/dev/null | \
+                _play_raw 48000 || true
+        fi
     fi
 }
 
@@ -2369,7 +3063,7 @@ cleanup_call() {
     overwrite_rm "$DATA_DIR/run/send_lock_$$"
 
     # Kill circuit refresh if active
-    if [ -n "$CIRCUIT_REFRESH_PID" ]; then
+    if [ -n "${CIRCUIT_REFRESH_PID:-}" ]; then
         kill "$CIRCUIT_REFRESH_PID" 2>/dev/null || true
         CIRCUIT_REFRESH_PID=""
     fi
@@ -2638,41 +3332,29 @@ _dial_remote() {
     local socat_pid=$!
     save_pid "socat_call" "$socat_pid"
 
-    # Animated connecting indicator
-    (
-        local dots=""
-        while true; do
-            for dots in "." ".." "..." "   "; do
-                echo -ne "\r  ${CYAN}${BOLD}Connecting${dots}${NC}   " >&2
-                sleep 0.3
-            done
-        done
-    ) &
-    local spinner_pid=$!
-
-    # Wait for socat to establish the Tor circuit (up to 120 s), with [Q] cancel.
-    # Tor hidden-service connections typically take 15–60 s on first circuit build.
-    local connect_timeout=120
+    # Wait for socat's SOCKS connect (up to DIAL_TIMEOUT s), with [Q] cancel.
+    # Tor hidden-service connections typically take 15-60 s on first circuit build.
     local connect_start; connect_start=$(date +%s)
     DIAL_RESULT="timeout"
 
     while true; do
-        # socat exited before connecting (bad address, refused, SOCKS error, etc.)
         if ! kill -0 "$socat_pid" 2>/dev/null; then
             DIAL_RESULT="refused"
             break
         fi
-        # SYSTEM command fired → TCP established
         if [ -f "$call_connected_flag" ]; then
             DIAL_RESULT="ok"
             break
         fi
-        # Hard timeout
-        if [ $(( $(date +%s) - connect_start )) -ge $connect_timeout ]; then
+        local elapsed=$(( $(date +%s) - connect_start ))
+        if [ $elapsed -ge "$DIAL_TIMEOUT" ]; then
             DIAL_RESULT="timeout"
             break
         fi
-        # Non-blocking key check (1-second poll)
+        # Progress: "Connecting... 23s (1/3)"
+        local _attempt_label=""
+        [ -n "${_DIAL_ATTEMPT_LABEL:-}" ] && _attempt_label=" $_DIAL_ATTEMPT_LABEL"
+        echo -ne "\r  ${CYAN}${BOLD}Connecting...${NC} ${DIM}${elapsed}s${_attempt_label}${NC}   " >&2
         local _key=""
         if read -r -t 1 _key 2>/dev/null; then
             case "$_key" in
@@ -2686,10 +3368,12 @@ _dial_remote() {
         fi
     done
 
-    kill "$spinner_pid" 2>/dev/null || true
-    wait "$spinner_pid" 2>/dev/null || true
-    echo -ne "\r                              " >&2
-    echo "" >&2
+    case "$DIAL_RESULT" in
+        ok)       echo -ne "\r  ${GREEN}Connected.${NC}                                  \r" >&2 ;;
+        timeout)  echo -e  "\r  ${RED}Timed out after ${DIAL_TIMEOUT}s${NC}                       " >&2 ;;
+        refused)  echo -e  "\r  ${RED}Connection refused${NC}                             " >&2 ;;
+        *)        echo -ne "\r                                            \r" >&2 ;;
+    esac
     overwrite_rm "$call_connected_flag"
 
     if [ "$DIAL_RESULT" != "ok" ]; then
@@ -2737,18 +3421,56 @@ call_remote() {
 
     mkdir -p "$AUDIO_DIR"
 
-    # Initial dial.
-    _dial_remote
+    # Initial dial with retry. Tor circuit builds can fail when the selected
+    # path is degraded; killing socat and re-dialing forces a new circuit.
+    local _dial_attempt=0
+    while [ "$_dial_attempt" -lt "$DIAL_ATTEMPTS" ]; do
+        _dial_attempt=$((_dial_attempt + 1))
+        _DIAL_ATTEMPT_LABEL="(${_dial_attempt}/${DIAL_ATTEMPTS})"
+        _dial_remote
+        unset _DIAL_ATTEMPT_LABEL
+
+        case "$DIAL_RESULT" in
+            ok)        break ;;
+            cancelled) break ;;
+            timeout|refused)
+                cleanup_call
+                if [ "$_dial_attempt" -lt "$DIAL_ATTEMPTS" ]; then
+                    local _reason="Timed out"
+                    [ "$DIAL_RESULT" = "refused" ] && _reason="Refused"
+                    echo -e "  ${YELLOW}${_reason}, retrying with fresh route... ($((_dial_attempt + 1))/${DIAL_ATTEMPTS})${NC}" >&2
+                    sleep 3
+                fi
+                ;;
+        esac
+    done
+
+    if [ "$DIAL_RESULT" != "ok" ] && [ "$DIAL_RESULT" != "cancelled" ] \
+       && [ $DOCKER_MODE -eq 0 ] && [ -n "$TOR_PID" ]; then
+        echo -e "  ${YELLOW}Circuits may be stale, restarting Tor...${NC}" >&2
+        kill "$TOR_PID" 2>/dev/null || true
+        wait "$TOR_PID" 2>/dev/null || true
+        TOR_PID=""
+        if start_tor; then
+            local _saved_timeout="$DIAL_TIMEOUT"
+            DIAL_TIMEOUT=90
+            _DIAL_ATTEMPT_LABEL="(final)"
+            _dial_remote
+            unset _DIAL_ATTEMPT_LABEL
+            DIAL_TIMEOUT="$_saved_timeout"
+        fi
+    fi
+
     if [ "$DIAL_RESULT" != "ok" ]; then
         case "$DIAL_RESULT" in
             cancelled) log_info "Connection cancelled." ;;
             timeout)
-                log_err "Connection timed out after 120s."
-                log_err "Is the remote machine running and listening? Is Tor fully bootstrapped?"
+                log_err "Could not reach this destination after ${DIAL_ATTEMPTS} attempt(s) + restart."
+                log_err "Tor circuit may have failed or the peer may be offline."
                 ;;
             refused)
-                log_err "Failed to connect. Check the .onion address and ensure the"
-                log_err "remote machine is running 'docker compose run --rm partyline' and listening."
+                log_err "Connection refused. Check the .onion address and ensure the"
+                log_err "remote is running and listening."
                 ;;
         esac
         cleanup_call
@@ -2838,7 +3560,7 @@ relay_mode() {
     echo -e "  ${YELLOW}All callers must use the same shared secret.${NC}"
     echo -e "  ${YELLOW}The relay operator does NOT need a shared secret.${NC}"
     echo ""
-    # Skip the confirmation when launched headlessly as `partyline.sh relay`
+    # Skip the confirmation when launched headlessly as `tor-party-line.sh relay`
     # (CLI subcommand); the menu path leaves CMD empty and still confirms.
     if [ "$CMD" != "relay" ]; then
         if ! confirm_yes "  ${BOLD}Start relay? [Y/n]: ${NC}"; then
@@ -2860,30 +3582,21 @@ relay_mode() {
     cat > "$relay_dir/handler.sh" << 'RELAY_HANDLER_EOF'
 #!/bin/bash
 RELAY_DIR="$1"
-IDLE_TIMEOUT="${2:-240}"   # drop this caller if no inbound traffic (audio/chat/PING) for N s
-# These reach the handler via argv, NOT the environment: the handler is a separate
-# script exec'd by socat, and the parent's MAX_LINE_BYTES/RELAY_WRITE_TIMEOUT/etc. are
-# plain (non-exported) shell vars, so they would otherwise arrive empty. The defaults
-# below mirror the parent's so a hand-launched handler still behaves sanely.
-MAX_LINE_BYTES="${3:-524288}"          # drop inbound lines larger than this (bytes)
-RELAY_WRITE_TIMEOUT="${4:-30}"         # seconds before abandoning a FIFO write to a slow client
-RELAY_MAX_MSG_PER_SEC="${5:-15}"       # per-caller inbound message rate cap (anti-flood)
-RELAY_MAX_INFLIGHT="${6:-64}"          # cap on concurrent background forward processes (fork-bomb guard)
+IDLE_TIMEOUT="${2:-240}"
+MAX_LINE_BYTES="${3:-524288}"
+RELAY_WRITE_TIMEOUT="${4:-30}"
+RELAY_MAX_MSG_PER_SEC="${5:-15}"
+RELAY_MAX_INFLIGHT="${6:-64}"
 ID="$$"
 OUTFIFO="$RELAY_DIR/out_${ID}.fifo"
 
 mkfifo "$OUTFIFO" 2>/dev/null || exit 1
 touch "$RELAY_DIR/client_${ID}"
 
-# Send relay greeting so clients detect group mode
 printf 'RELAY:1\n'
 
-# Portable helpers (this handler is a standalone script, so it carries its own
-# copies). macOS ships neither `flock` nor `timeout`; these need only POSIX shell.
-# _lock: atomic mkdir spinlock, bounded (~5s) so a -9'd holder can't deadlock others.
 _lock()   { local d="$1.lockd" n=0; while ! mkdir "$d" 2>/dev/null; do n=$((n + 1)); [ "$n" -ge 250 ] && return 0; sleep 0.02; done; }
 _unlock() { rmdir "$1.lockd" 2>/dev/null; }
-# _timeout: real timeout/gtimeout when present (Linux), else background sleep+kill.
 _timeout() {
     if command -v timeout >/dev/null 2>&1; then command timeout "$@"; return; fi
     if command -v gtimeout >/dev/null 2>&1; then command gtimeout "$@"; return; fi
@@ -2895,7 +3608,57 @@ _timeout() {
     return "$_rc"
 }
 
-# Broadcast group count to all connected clients
+# Per-destination persistent writer. One background process per destination
+# FIFO reads from a regular pipe (not a FIFO) and writes serialized lines
+# to the destination. Replaces fork-per-message fan-out so full-duplex
+# rates (~17 msg/s per caller) do not spawn unbounded subshells.
+declare -A DST_FDS DST_PIDS
+_next_fd=10
+
+_ensure_writer() {
+    local dest="$1"
+    if [ -n "${DST_FDS[$dest]:-}" ] && kill -0 "${DST_PIDS[$dest]:-0}" 2>/dev/null; then
+        return 0
+    fi
+    [ -p "$dest" ] || return 1
+    local fd=$_next_fd
+    _next_fd=$((_next_fd + 1))
+    local pipeR pipeW
+    pipeR="$RELAY_DIR/fwd_${ID}_$(basename "$dest" .fifo).pipe"
+    rm -f "$pipeR"
+    mkfifo "$pipeR" 2>/dev/null || return 1
+    (
+        trap 'exit 0' PIPE TERM
+        while IFS= read -r _fw_msg; do
+            _lock "${dest%.fifo}.lock"
+            _timeout "${RELAY_WRITE_TIMEOUT}" sh -c \
+                'printf "%s\n" "$1" > "$2"' - "$_fw_msg" "$dest" 2>/dev/null
+            _unlock "${dest%.fifo}.lock"
+        done < "$pipeR"
+    ) &
+    DST_PIDS["$dest"]=$!
+    eval "exec ${fd}>\"$pipeR\""
+    DST_FDS["$dest"]=$fd
+}
+
+_write_to() {
+    local dest="$1" msg="$2"
+    _ensure_writer "$dest" || return 1
+    local fd="${DST_FDS[$dest]}"
+    printf '%s\n' "$msg" >&"$fd" 2>/dev/null
+}
+
+_close_writers() {
+    for _cw_dest in "${!DST_FDS[@]}"; do
+        eval "exec ${DST_FDS[$_cw_dest]}>&-" 2>/dev/null
+        kill "${DST_PIDS[$_cw_dest]}" 2>/dev/null
+        wait "${DST_PIDS[$_cw_dest]}" 2>/dev/null
+    done
+    rm -f "$RELAY_DIR"/fwd_${ID}_*.pipe
+    DST_FDS=()
+    DST_PIDS=()
+}
+
 broadcast_count() {
     local count=0
     for cf in "$RELAY_DIR"/client_*; do
@@ -2903,115 +3666,78 @@ broadcast_count() {
     done
     for f in "$RELAY_DIR"/out_*.fifo; do
         [ -p "$f" ] || continue
-        # Same per-destination serialization as the fan-out: a GROUP beacon must
-        # not splice into the middle of an in-flight AUDIO write. (The beacon is
-        # tiny, but it is a concurrent WRITER, so it must take the lock too.)
         ( _lock "${f%.fifo}.lock"; _timeout "${RELAY_WRITE_TIMEOUT}" sh -c 'printf "GROUP:%s\n" "$1" > "$2"' - "$count" "$f"; _unlock "${f%.fifo}.lock" ) 2>/dev/null &
     done
 }
 
+cleanup_handler() {
+    exec 3>&- 2>/dev/null
+    kill $WR_PID 2>/dev/null
+    wait $WR_PID 2>/dev/null
+    _close_writers
+    if [ -f "$RELAY_DIR/stats_${ID}" ]; then
+        read -r _fi _fo < "$RELAY_DIR/stats_${ID}" 2>/dev/null || { _fi=0; _fo=0; }
+        (
+            _lock "$RELAY_DIR/.stats_lock"
+            _ti=0; _to=0
+            [ -f "$RELAY_DIR/stats_total" ] && read -r _ti _to < "$RELAY_DIR/stats_total" 2>/dev/null
+            echo "$((_ti + ${_fi:-0})) $((_to + ${_fo:-0}))" > "$RELAY_DIR/stats_total"
+            _unlock "$RELAY_DIR/.stats_lock"
+        )
+    fi
+    rm -f "$OUTFIFO" "${OUTFIFO%.fifo}.lock" "$RELAY_DIR/client_${ID}" \
+          "$RELAY_DIR/stats_${ID}" "$RELAY_DIR"/fwd_${ID}_*.pipe
+    broadcast_count
+}
+trap cleanup_handler EXIT
+
 # Writer: reads from outbox FIFO, sends to network (stdout)
-# Starts in background — blocks until keepalive writer opens below
 while IFS= read -r msg; do
     printf '%s\n' "$msg"
 done < "$OUTFIFO" &
 WR_PID=$!
 
-# Persistent writer on OUTFIFO so the `while read` loop above never sees EOF.
-# Each `printf ... > "$OUTFIFO"` in the broadcaster opens and immediately
-# closes the FIFO; without a permanent writer those closes would deliver EOF
-# to the reader and drop the connection. This fd stays open for the lifetime
-# of the handler, keeping the loop alive between messages.
 exec 3>"$OUTFIFO"
 
-# Announce updated group size (includes this new caller)
 sleep 0.3
 broadcast_count
 
-# Reader: network (stdin) → broadcast to all other outboxes
-# Only forward audio, chat, pings, and group updates
 BYTES_IN=0
 BYTES_OUT=0
-# Flood control state (per-caller — each handler is its own process):
-#   RATE_WIN/RATE_COUNT — a 1-second token bucket keyed off the bash SECONDS builtin.
-#   FWD_PIDS            — tracks in-flight background forward writes so we can cap how
-#                         many run at once (the fork-bomb guard).
 RATE_WIN=$SECONDS
 RATE_COUNT=0
 FWD_PIDS=()
-# Timed read: if no line arrives within IDLE_TIMEOUT the caller is presumed gone
-# (roamed/dropped/half-open TCP). read returns non-zero, the loop exits, and the
-# cleanup below removes this caller's marker/FIFO and broadcasts the lower count —
-# independent of the kernel's ~15 min TCP timeout. Clients send periodic PINGs so a
-# quiet-but-connected caller keeps this read fed and is NOT reaped.
-while IFS= read -r -t "$IDLE_TIMEOUT" line; do
-    # Track inbound bytes
+GOT_FIRST_MSG=0
+ACTIVE_TIMEOUT="$IDLE_TIMEOUT"
+
+while IFS= read -r -t "$ACTIVE_TIMEOUT" line; do
     BYTES_IN=$((BYTES_IN + ${#line}))
-    # Drop oversized lines before forwarding — prevents memory/process exhaustion
     [ "${#line}" -gt "${MAX_LINE_BYTES}" ] && continue
-    # Strip HMAC wrapper if present (nonce:payload|sig → payload)
     local_payload="$line"
     case "$line" in *"|"*) local_payload="${line%|*}"; local_payload="${local_payload#*:}" ;; esac
-    # Filter: only forward AUDIO:, MSG:, PING, and GROUP:
     case "$local_payload" in
-        AUDIO:*|MSG:*|PING|GROUP:*) ;;
+        AUDIO:*|FDAUDIO:*|MSG:*|PING|GROUP:*) ;;
         *) continue ;;
     esac
-    # Per-caller rate limit: cap forwarded messages per second. A flooding caller
-    # (e.g. a held PTT or a scripted client) has its excess dropped BEFORE the
-    # expensive fan-out, so no one caller can saturate or mute the others. Normal
-    # load is ~1-2 msg/s during active talk, well under the cap.
-    if [ "$SECONDS" -ne "$RATE_WIN" ]; then RATE_WIN=$SECONDS; RATE_COUNT=0; fi
-    RATE_COUNT=$((RATE_COUNT + 1))
-    [ "$RATE_COUNT" -gt "$RELAY_MAX_MSG_PER_SEC" ] && continue
+    if [ "$GOT_FIRST_MSG" -eq 0 ]; then
+        GOT_FIRST_MSG=1
+        ACTIVE_TIMEOUT=60
+    fi
+    # FDAUDIO frames are self-rate-limited by the encoder (60ms cadence)
+    # and small (~200 bytes), so they bypass the per-second cap.
+    case "$local_payload" in FDAUDIO:*) ;; *)
+        if [ "$SECONDS" -ne "$RATE_WIN" ]; then RATE_WIN=$SECONDS; RATE_COUNT=0; fi
+        RATE_COUNT=$((RATE_COUNT + 1))
+        [ "$RATE_COUNT" -gt "$RELAY_MAX_MSG_PER_SEC" ] && continue
+    ;; esac
     for f in "$RELAY_DIR"/out_*.fifo; do
         [ "$f" = "$OUTFIFO" ] && continue
         [ -p "$f" ] || continue
-        # Bound concurrent forwards: once RELAY_MAX_INFLIGHT writes are outstanding,
-        # block on the oldest before spawning another. A stalled client (not reading
-        # its FIFO) holds a write open until RELAY_WRITE_TIMEOUT, so without this cap a
-        # flood could spawn unbounded `timeout sh` procs — the fork bomb. Reaping the
-        # oldest also prevents zombie buildup. Portable to bash 3.2 (no `wait -n`).
-        if [ "${#FWD_PIDS[@]}" -ge "$RELAY_MAX_INFLIGHT" ]; then
-            wait "${FWD_PIDS[0]}" 2>/dev/null
-            FWD_PIDS=("${FWD_PIDS[@]:1}")
-        fi
-        # Serialize writes to THIS destination FIFO. Large AUDIO: lines exceed
-        # PIPE_BUF, so concurrent writers (this handler's fan-out, other handlers'
-        # fan-out, broadcast_count) to the same out_*.fifo splice and corrupt the
-        # line — the receiver's HMAC/base64 then fails and the clip is dropped.
-        # Lock is keyed on the DESTINATION path so writers in different handler
-        # processes share it. Mirrors proto_send's send-side _lock.
-        # The `sh -c '... > "$2"'` indirection keeps the FIFO open inside timeout,
-        # so a vanished reader can't block the open while holding the lock.
-        ( _lock "${f%.fifo}.lock"; _timeout "${RELAY_WRITE_TIMEOUT}" sh -c 'printf "%s\n" "$1" > "$2"' - "$line" "$f"; _unlock "${f%.fifo}.lock" ) 2>/dev/null &
-        FWD_PIDS+=("$!")
+        _write_to "$f" "$line"
         BYTES_OUT=$((BYTES_OUT + ${#line}))
     done
-    # Write stats periodically (every message)
     echo "$BYTES_IN $BYTES_OUT" > "$RELAY_DIR/stats_${ID}"
 done
-
-# Client disconnected — cleanup
-exec 3>&-
-kill $WR_PID 2>/dev/null
-wait $WR_PID 2>/dev/null
-
-# Accumulate this caller's stats into persistent totals before removing
-if [ -f "$RELAY_DIR/stats_${ID}" ]; then
-    read -r _fi _fo < "$RELAY_DIR/stats_${ID}" 2>/dev/null || { _fi=0; _fo=0; }
-    (
-        _lock "$RELAY_DIR/.stats_lock"
-        _ti=0; _to=0
-        [ -f "$RELAY_DIR/stats_total" ] && read -r _ti _to < "$RELAY_DIR/stats_total" 2>/dev/null
-        echo "$((_ti + ${_fi:-0})) $((_to + ${_fo:-0}))" > "$RELAY_DIR/stats_total"
-        _unlock "$RELAY_DIR/.stats_lock"
-    )
-fi
-rm -f "$OUTFIFO" "${OUTFIFO%.fifo}.lock" "$RELAY_DIR/client_${ID}" "$RELAY_DIR/stats_${ID}"
-
-# Broadcast updated count (one fewer)
-broadcast_count
 RELAY_HANDLER_EOF
     chmod +x "$relay_dir/handler.sh"
 
@@ -3286,6 +4012,189 @@ start_circuit_refresh() {
     CIRCUIT_REFRESH_PID=$!
 }
 
+_fullduplex_session() {
+    local fd_ctrl="$DATA_DIR/run/fd_ctrl_$$"
+    rm -f "$fd_ctrl"; mkfifo "$fd_ctrl"
+    exec 8<> "$fd_ctrl"
+
+    local _fd_stderr="$DATA_DIR/run/fd_engine_$$.stderr"
+    exec 3<&-  # drop shell's write-ref so engine sees EOF on remote disconnect
+    FD_SECRET="$SHARED_SECRET" \
+    python3 "$FD_ENGINE_PY" "$recv_pipe" "$send_pipe" \
+        "$SAMPLE_RATE" "$((OPUS_BITRATE * 1000))" \
+        "$START_MUTED" \
+        > "$fd_ctrl" 2>"$_fd_stderr" &
+    local fd_engine_pid=$!
+    save_pid "fd_engine" "$fd_engine_pid"
+
+    # Background: read protocol lines forwarded by the engine (everything
+    # except FDAUDIO: which the engine handles internally).
+    (
+        trap 'rm -f "$CONNECTED_FLAG"' EXIT
+        while IFS= read -r -t "$CLIENT_TIMEOUT" line <&8; do
+            if [[ "$line" == GROUP:* ]]; then
+                if [ ! -f "$relay_flag_file" ]; then touch "$relay_flag_file"; fi
+                local _gcount="${line#GROUP:}"
+                echo "$_gcount" > "$DATA_DIR/run/group_count_$$" 2>/dev/null || true
+                [ -f "$MENU_FLAG" ] || status_at "$REMOTE_STATUS_ROW" \
+                    '  \033[2mGroup:      \033[0m\033[1;37m%s callers\033[0m' "$_gcount"
+                continue
+            fi
+            [[ "$line" == RELAY:* ]] && { [ ! -f "$relay_flag_file" ] && touch "$relay_flag_file"; continue; }
+
+            line=$(proto_verify "$line") || continue
+            case "$line" in
+                PING|PTT_START|PTT_STOP) ;;
+                ID:*)    echo "${line#ID:}" > "$remote_id_file" 2>/dev/null || true ;;
+                CIPHER:*) echo "${line#CIPHER:}" > "$remote_cipher_file" 2>/dev/null || true ;;
+                MODE:*)  echo "${line#MODE:}" > "$DATA_DIR/run/remote_mode_$$" 2>/dev/null || true ;;
+                MSG:*)
+                    local msg_b64="${line#MSG:}"
+                    [ "${#msg_b64}" -gt "${MAX_MSG_B64}" ] && continue
+                    local _mid; _mid=$(uid)
+                    local msg_enc="$AUDIO_DIR/msg_enc_${_mid}.tmp"
+                    local msg_dec="$AUDIO_DIR/msg_dec_${_mid}.tmp"
+                    base64 -d <<< "$msg_b64" > "$msg_enc" 2>/dev/null || true
+                    if [ -s "$msg_enc" ] && decrypt_file "$msg_enc" "$msg_dec" 2>/dev/null; then
+                        local msg_text; msg_text=$(<"$msg_dec")
+                        printf '\r\n  %b%b[MSG]%b %b%s%b\r\n' \
+                            "$MAGENTA" "$BOLD" "$NC" "$WHITE" "$msg_text" "$NC" >&2
+                    fi
+                    overwrite_rm "$msg_enc" "$msg_dec"
+                    ;;
+                AUDIO:*)
+                    local b64_data="${line#AUDIO:}"
+                    [ "${#b64_data}" -gt "${MAX_AUDIO_B64}" ] && continue
+                    local _rid; _rid=$(uid)
+                    local enc_file="$AUDIO_DIR/recv_enc_${_rid}.tmp"
+                    local dec_file="$AUDIO_DIR/recv_dec_${_rid}.tmp"
+                    base64 -d <<< "$b64_data" > "$enc_file" 2>/dev/null || true
+                    if [ -s "$enc_file" ] && decrypt_file "$enc_file" "$dec_file" 2>/dev/null; then
+                        if [ "${PLAY_QUEUE_FD:-0}" -ne 0 ]; then
+                            local _pq_file="$AUDIO_DIR/play_$(uid).opus"
+                            mv "$dec_file" "$_pq_file" 2>/dev/null && \
+                                printf '%s\n' "$_pq_file" >&7 || \
+                                overwrite_rm "$_pq_file"
+                            dec_file=""
+                        else
+                            play_chunk "$dec_file" 2>/dev/null || true
+                        fi
+                    fi
+                    overwrite_rm "$enc_file" "$dec_file"
+                    ;;
+                HANGUP)
+                    if [ -f "$relay_flag_file" ]; then continue; fi
+                    echo -e "\r\n\r\n  ${YELLOW}${BOLD}Remote party hung up.${NC}" >&2
+                    echo "hangup" > "$DROP_REASON_FILE" 2>/dev/null || true
+                    rm -f "$CONNECTED_FLAG"
+                    break
+                    ;;
+            esac
+        done
+    ) &
+    local recv_pid=$!
+    save_pid "recv_loop" "$recv_pid"
+
+    # Status bar
+    ORIGINAL_STTY=$(stty -g)
+    stty raw -echo -icanon min 0 time 1
+    local _fd_mute_flag="$DATA_DIR/run/fd_muted_$$"
+    rm -f "$_fd_mute_flag"
+
+    printf '\0337\033[%d;1H\033[K' "$STATUS_ROW" >&2
+    if [ "$START_MUTED" -eq 1 ]; then
+        touch "$_fd_mute_flag"
+        printf '  \033[1;33m● MUTED \033[0m \033[2m[M]=Unmute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+    else
+        printf '  \033[1;32m● LIVE \033[0m \033[2m[M]=Mute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+    fi
+    printf '\0338' >&2
+
+    while [ -f "$CONNECTED_FLAG" ]; do
+        local key=""
+        if [ -f "$vol_trigger_file" ]; then
+            overwrite_rm "$vol_trigger_file"
+            key="m"
+        else
+            key=$(dd bs=1 count=1 2>/dev/null) || true
+        fi
+
+        case "$key" in
+            q|Q)
+                echo -e "\r\n${YELLOW}Hanging up...${NC}" >&2
+                proto_send "HANGUP"
+                echo "hangup" > "$DROP_REASON_FILE" 2>/dev/null || true
+                overwrite_rm "$CONNECTED_FLAG"
+                break
+                ;;
+            m|M)
+                kill -USR1 "$fd_engine_pid" 2>/dev/null || true
+                if [ -f "$_fd_mute_flag" ]; then
+                    rm -f "$_fd_mute_flag"
+                    printf '\0337\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                    printf '  \033[1;32m● LIVE \033[0m \033[2m[M]=Mute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                    printf '\0338' >&2
+                else
+                    touch "$_fd_mute_flag"
+                    printf '\0337\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                    printf '  \033[1;33m● MUTED \033[0m \033[2m[M]=Unmute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                    printf '\0338' >&2
+                fi
+                ;;
+            t|T)
+                touch "$MENU_FLAG"
+                stty "$ORIGINAL_STTY" 2>/dev/null || stty sane
+                echo "" >&2
+                echo -ne "  ${CYAN}${BOLD}MSG>${NC} " >&2
+                local chat_msg="" _chat_max=$(( MAX_MSG_B64 / 2 ))
+                [ "$_chat_max" -ge 1 ] || _chat_max=1
+                read -r -e -n "$_chat_max" chat_msg
+                if [ -n "$chat_msg" ]; then
+                    local _cid; _cid=$(uid)
+                    local chat_plain="$AUDIO_DIR/chat_${_cid}.tmp"
+                    local chat_enc="$AUDIO_DIR/chat_enc_${_cid}.tmp"
+                    echo -n "$chat_msg" > "$chat_plain"
+                    encrypt_file "$chat_plain" "$chat_enc" 2>/dev/null
+                    if [ -s "$chat_enc" ]; then
+                        local chat_b64
+                        chat_b64=$(base64 < "$chat_enc" | tr -d '\n')
+                        proto_send "MSG:${chat_b64}"
+                        echo -e "  ${DIM}[you] ${chat_msg}${NC}" >&2
+                    fi
+                    overwrite_rm "$chat_plain" "$chat_enc"
+                fi
+                stty raw -echo -icanon min 0 time 1
+                read -r -t 0.1 -n 100000 _ 2>/dev/null || true
+                rm -f "$MENU_FLAG"
+                printf '\0337\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                printf '  \033[1;32m● LIVE \033[0m \033[2m[M]=Mute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                printf '\0338' >&2
+                ;;
+            s|S)
+                touch "$MENU_FLAG"
+                stty "$ORIGINAL_STTY" 2>/dev/null || stty sane
+                read -r -t 0.1 -n 10000 2>/dev/null || true
+                settings_menu
+                local _rd="" _rc=""
+                [ -f "$remote_id_file" ] && _rd="$(<"$remote_id_file")"
+                [ -z "$_rd" ] && _rd="$known_remote"
+                [ -f "$remote_cipher_file" ] && _rc="$(<"$remote_cipher_file")"
+                draw_call_header "$_rd" "$_rc"
+                rm -f "$MENU_FLAG"
+                stty raw -echo -icanon min 0 time 1
+                printf '\0337\033[%d;1H\033[K' "$STATUS_ROW" >&2
+                printf '  \033[1;32m● LIVE \033[0m \033[2m[M]=Mute [T]=Chat [S]=Settings [Q]=Hang up\033[0m   ' >&2
+                printf '\0338' >&2
+                ;;
+        esac
+    done
+
+    kill "$fd_engine_pid" 2>/dev/null || true
+    wait "$fd_engine_pid" 2>/dev/null || true
+    exec 8<&-
+    rm -f "$fd_ctrl" "$_fd_mute_flag" "$_fd_stderr"
+}
+
 in_call_session() {
     local recv_pipe="$1"
     local send_pipe="$2"
@@ -3333,6 +4242,7 @@ in_call_session() {
         proto_send "ID:${my_onion}"
     fi
     proto_send "CIPHER:${CIPHER}"
+    [ "$FULL_DUPLEX" -eq 1 ] && proto_send "MODE:fullduplex"
 
     # Heartbeat: send a PING every HEARTBEAT_INTERVAL seconds so the relay knows we
     # are still alive even during long silences. Without this, a relay handler can't
@@ -3414,6 +4324,25 @@ in_call_session() {
     # Draw call header
     draw_call_header "$remote_display" "$remote_cipher"
 
+    # Full-duplex: launch the Python audio engine instead of the PTT loop.
+    # The engine reads recv_pipe (FDAUDIO: frames) and forwards non-audio
+    # protocol lines to bash via a control pipe.
+    if [ "$FULL_DUPLEX" -eq 1 ]; then
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo -e "\n${RED}${BOLD}  Full-duplex requires python3.${NC}"
+            echo -e "  ${DIM}Install it with the 'Install dependencies' menu option.${NC}\n"
+            return
+        fi
+        if write_fullduplex_engine; then
+            _fullduplex_session
+            rm -f "$MENU_FLAG"
+            echo -e "\n${BOLD}${RED} CALL ENDED ${NC}\n"
+            return
+        else
+            log_err "Could not prepare full-duplex engine; falling back to PTT."
+        fi
+    fi
+
     # Start periodic circuit refresh
     CIRCUIT_REFRESH_PID=""
     start_circuit_refresh
@@ -3456,6 +4385,7 @@ in_call_session() {
                 case "$line" in
                     PTT_START)
                         [ -f "$MENU_FLAG" ] || status_at "$REMOTE_STATUS_ROW" '  \033[2mRemote:     \033[0m\033[1;31m● Recording\033[0m'
+
                         ;;
                     PTT_STOP)
                         [ -f "$MENU_FLAG" ] || status_at "$REMOTE_STATUS_ROW" '  \033[2mRemote:     \033[0m\033[1;32mIdle\033[0m'
@@ -3514,6 +4444,7 @@ in_call_session() {
                     AUDIO:*)
                         # Extract base64 data, decode, decrypt, play
                         local b64_data="${line#AUDIO:}"
+                        [ "${#b64_data}" -gt "${MAX_AUDIO_B64}" ] && continue
                         local _rid; _rid=$(uid)
                         local enc_file="$AUDIO_DIR/recv_enc_${_rid}.tmp"
                         local dec_file="$AUDIO_DIR/recv_dec_${_rid}.tmp"
@@ -3547,6 +4478,15 @@ in_call_session() {
                             fi
                         fi
                         overwrite_rm "$enc_file" "$dec_file"
+                        ;;
+                    FDAUDIO:*)
+                        # Full-duplex frame from a peer in FD mode. In PTT
+                        # receive mode we cannot decrypt without the engine.
+                        # Silent no-op; AUDIO: chunks from PTT peers work.
+                        ;;
+                    MODE:*)
+                        local _rmode="${line#MODE:}"
+                        echo "$_rmode" > "$DATA_DIR/run/remote_mode_$$" 2>/dev/null || true
                         ;;
                     HANGUP)
                         # In relay mode, ignore HANGUP (others may still be connected)
@@ -3649,13 +4589,13 @@ in_call_session() {
 
         elif [ "$key" = "q" ] || [ "$key" = "Q" ]; then
             # If recording, cancel it
-            if [ $ptt_active -eq 1 ] && [ -n "$REC_PID" ]; then
+            if [ $ptt_active -eq 1 ] && [ -n "${REC_PID:-}" ]; then
                 if [ $IS_TERMUX -eq 1 ]; then
                     termux-microphone-record -q &>/dev/null || true
                 fi
                 kill "$REC_PID" 2>/dev/null || true
                 wait "$REC_PID" 2>/dev/null || true
-                overwrite_rm "$REC_FILE"
+                overwrite_rm "${REC_FILE:-}"
                 REC_PID=""
                 REC_FILE=""
             fi
@@ -3748,13 +4688,13 @@ in_call_session() {
 
     # If the recv subshell died mid-recording (its EXIT trap drops CONNECTED_FLAG,
     # the PTT loop exits without going through the Q branch), kill the dangling recorder.
-    if [ -n "$REC_PID" ]; then
+    if [ -n "${REC_PID:-}" ]; then
         if [ $IS_TERMUX -eq 1 ]; then
             termux-microphone-record -q &>/dev/null || true
         fi
         kill "$REC_PID" 2>/dev/null || true
         wait "$REC_PID" 2>/dev/null || true
-        overwrite_rm "$REC_FILE"
+        overwrite_rm "${REC_FILE:-}"
         REC_PID=""; REC_FILE=""
     fi
 
@@ -4005,6 +4945,7 @@ show_status() {
     echo -e "  ${DIM}Cipher:       $CIPHER${NC}"
     echo -e "  ${DIM}Opus bitrate: ${OPUS_BITRATE}kbps${NC}"
     echo -e "  ${DIM}Opus frame:   ${OPUS_FRAMESIZE}ms${NC}"
+    echo -e "  ${DIM}Dial:         ${DIAL_ATTEMPTS} attempts x ${DIAL_TIMEOUT}s${NC}"
     echo -e "  ${DIM}PTT key:      [SPACEBAR]${NC}"
     echo ""
 }
@@ -4192,6 +5133,8 @@ _settings_audio_android() {
         esac
     done
 }
+
+
 
 # Internal: emit raw S16LE mono white noise to stdout for <secs> seconds.
 # Uses sox at a comfortable volume when available; otherwise full-scale random
@@ -4384,8 +5327,7 @@ _audio_diagnostics() {
     # NOTE: every command substitution below ends in `|| true`. The app runs under
     # `set -euo pipefail`, so a pipeline whose last stage exits non-zero (grep with
     # no match, a missing sink/control) would otherwise fail the bare assignment
-    # and abort the whole program — which is exactly what killed the Tor session
-    # the first time this screen ran. `|| true` keeps diagnostics read-only-safe.
+    # and abort the whole program. `|| true` keeps diagnostics read-only-safe.
     if check_dep pactl && _server_available; then
         local _def; _def=$(pactl get-default-sink 2>/dev/null || true)
         echo -e "    Default sink: ${WHITE}${_def:-?}${NC}"
@@ -4646,6 +5588,17 @@ settings_menu() {
         local hmac_label="$(onoff_label "$HMAC_AUTH")"
         echo -e "  ${DIM}HMAC auth:            ${NC}${hmac_label}"
 
+        local norm_label="$(onoff_label "$NORMALIZE_PLAYBACK")"
+        echo -e "  ${DIM}Normalize playback:   ${NC}${norm_label}"
+
+        local fd_label="$(onoff_label "$FULL_DUPLEX")"
+        echo -e "  ${DIM}Full-duplex audio:    ${NC}${fd_label}  ${DIM}(single-hop only)${NC}"
+
+        if [ "$FULL_DUPLEX" -eq 1 ]; then
+            local sm_label="$(onoff_label "$START_MUTED")"
+            echo -e "  ${DIM}Start muted:          ${NC}${sm_label}"
+        fi
+
         local audio_label
         if [ $IS_TERMUX -eq 1 ]; then
             audio_label="${WHITE}Termux${NC}"
@@ -4673,7 +5626,12 @@ settings_menu() {
             echo -e "  ${BOLD}${WHITE}5${NC} ${CYAN}│${NC} Tor settings  ${DIM}(circuit display, country exclusions — restart to apply)${NC}"
         fi
         echo -e "  ${BOLD}${WHITE}6${NC} ${CYAN}│${NC} Security"
-        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Audio devices  ${DIM}(microphone, speakers, Bluetooth)${NC}"
+        echo -e "  ${BOLD}${WHITE}7${NC} ${CYAN}│${NC} Normalize playback  ${DIM}(level all callers to the same volume)${NC}"
+        echo -e "  ${BOLD}${WHITE}8${NC} ${CYAN}│${NC} Audio devices  ${DIM}(microphone, speakers, Bluetooth)${NC}"
+        echo -e "  ${BOLD}${WHITE}d${NC} ${CYAN}│${NC} Full-duplex audio  ${DIM}(live bidirectional, single-hop only)${NC}"
+        if [ "$FULL_DUPLEX" -eq 1 ]; then
+            echo -e "  ${BOLD}${WHITE}f${NC} ${CYAN}│${NC} Start muted  ${DIM}(begin full-duplex calls with mic muted)${NC}"
+        fi
         echo -e "  ${BOLD}${WHITE}0${NC} ${CYAN}│${NC} ${DIM}Back to main menu${NC}"
         echo ""
         echo -ne "  ${BOLD}Select: ${NC}"
@@ -4760,7 +5718,54 @@ settings_menu() {
                 ;;
             5) settings_tor ;;
             6) settings_security ;;
-            7) audio_menu ;;
+            7)
+                if [ "$NORMALIZE_PLAYBACK" -eq 1 ]; then
+                    NORMALIZE_PLAYBACK=0
+                    log_ok "Playback normalization disabled"
+                else
+                    ensure_pcm_rms
+                    NORMALIZE_PLAYBACK=1
+                    if command -v pcm_rms >/dev/null 2>&1; then
+                        log_ok "Playback normalization enabled"
+                    else
+                        log_ok "Playback normalization enabled (pcm_rms unavailable, will skip)"
+                    fi
+                fi
+                save_config; sleep 1
+                ;;
+            8) audio_menu ;;
+            d|D)
+                if [ "$FULL_DUPLEX" -eq 1 ]; then
+                    FULL_DUPLEX=0
+                    log_ok "Full-duplex disabled (PTT mode)"
+                else
+                    if [ "$SINGLE_HOP" -ne 1 ]; then
+                        echo -e "\n  ${RED}Full-duplex requires single-hop mode (--single-hop).${NC}"
+                        echo -e "  ${YELLOW}Enable single-hop first via Tor settings (option 5).${NC}"
+                        sleep 2
+                        continue
+                    fi
+                    FULL_DUPLEX=1
+                    log_ok "Full-duplex enabled (live bidirectional audio)"
+                    echo -e "  ${YELLOW}Only available in single-hop mode for latency.${NC}"
+                fi
+                save_config; sleep 1
+                ;;
+            f|F)
+                if [ "$FULL_DUPLEX" -ne 1 ]; then
+                    echo -e "\n  ${RED}Enable full-duplex first (option d).${NC}"
+                    sleep 2
+                    continue
+                fi
+                if [ "$START_MUTED" -eq 1 ]; then
+                    START_MUTED=0
+                    log_ok "Start muted disabled (mic will be live on join)"
+                else
+                    START_MUTED=1
+                    log_ok "Start muted enabled (mic muted on join)"
+                fi
+                save_config; sleep 1
+                ;;
             0|q|Q) return ;;
             *)
                 menu_invalid
@@ -5134,8 +6139,7 @@ _hmac_body() {
     echo -e "  ${DIM}secret cannot inject commands like HANGUP to disconnect${NC}"
     echo -e "  ${DIM}your call or forge audio and text messages.${NC}"
     echo ""
-    echo -e "  ${YELLOW}Both parties must have HMAC enabled for calls to work.${NC}"
-    echo -e "  ${YELLOW}Not compatible with versions prior to 1.1.3.${NC}"
+    echo -e "  ${YELLOW}Both ends must have HMAC set to the same value for calls to work.${NC}"
     echo ""
 }
 
@@ -5419,9 +6423,8 @@ show_banner() {
     echo -e "${BOLD}${TOR_PURPLE}  ╔╦╗┌─┐┬─┐  ╔═╗┌─┐┬─┐┌┬┐┬ ┬  ╦  ┬┌┐┌┌─┐${NC}"
     echo -e "${BOLD}${TOR_PURPLE}   ║ │ │├┬┘  ╠═╝├─┤├┬┘ │ └┬┘  ║  ││││├┤ ${NC}"
     echo -e "${BOLD}${TOR_PURPLE}   ╩ └─┘┴└─  ╩  ┴ ┴┴└─ ┴  ┴   ╩═╝┴┘└┘└─┘${NC}"
+    echo -e "  ${DIM}           The Onion Router${NC}"
     echo ""
-    echo -e "  ${TOR_PURPLE}───────────────────────────────────────────${NC}"
-    echo -e "  ${TOR_PURPLE}${BOLD}Encrypted Voice & Group Bridge${NC} ${DIM}over${NC} ${TOR_PURPLE}${BOLD}Tor${NC}"
     echo -e "  ${TOR_PURPLE}───────────────────────────────────────────${NC}"
     local cipher_display
     cipher_display="$(to_upper "$CIPHER")"
@@ -5430,7 +6433,7 @@ show_banner() {
     # means no sound server, so audio falls back to ALSA direct and hits EBUSY.
     if [ $DOCKER_MODE -eq 0 ] && [ "${EUID:-$(id -u)}" -eq 0 ]; then
         echo -e "  ${YELLOW}${BOLD}⚠  WARNING: running as root — audio will fail ('Device or resource busy')${NC}"
-        echo -e "  ${YELLOW}   Fix: run without sudo  →  ./partyline.sh${NC}"
+        echo -e "  ${YELLOW}   Fix: run without sudo  →  ./tor-party-line.sh${NC}"
         echo -e "  ${YELLOW}   (Option 9 installs packages — it handles sudo internally.)${NC}"
         echo ""
     fi
@@ -5698,6 +6701,12 @@ _cli_single_hop=""
 _cli_auto_listen=""
 _cli_show_circuit=""
 
+_cli_normalize=""
+_cli_fullduplex=""
+_cli_start_muted=""
+_cli_dial_attempts=""
+_cli_dial_timeout=""
+
 print_cli_help() {
     cat <<EOF
 $(echo -e "${BOLD}${APP_NAME} v${VERSION}${NC}") — Encrypted push-to-talk voice over Tor
@@ -5725,11 +6734,17 @@ $(echo -e "${BOLD}Options:${NC}") $(echo -e "${DIM}(defaults in [brackets]; prec
   -c, --cipher NAME     OpenSSL cipher (e.g. aes-256-cbc, chacha20)  [aes-256-cbc]
   -b, --bitrate N       Opus bitrate in kbps                    [16]
       --exclude-nodes L Tor ExcludeNodes (e.g. '{US},{GB}')     [none]
-      --hmac            Sign all protocol messages with HMAC  (--no-hmac)        [off]
+      --hmac            Sign all protocol messages with HMAC  (--no-hmac)        [on]
       --snowflake       Use the Snowflake bridge              (--no-snowflake)   [off]
       --single-hop      Single-hop hidden service (faster, less anon) (--no-single-hop) [off]
       --auto-listen     Auto-listen after Tor starts          (--no-auto-listen) [off]
       --show-circuit    Show Tor circuit hops in call header  (--no-show-circuit)[off]
+
+      --normalize      Level all callers to the same volume    (--no-normalize)[off]
+      --full-duplex    Live bidirectional audio (single-hop)   (--no-full-duplex)[off]
+      --start-muted    Begin full-duplex calls muted     (--no-start-muted)[on]
+      --dial-attempts N Retry initial dial N times             [3]
+      --dial-timeout N  Per-attempt SOCKS timeout in seconds   [60]
       --save            Persist all supplied options to the config file
   -h, --help            Show this help and exit
   -V, --version         Print version and exit
@@ -5781,6 +6796,8 @@ parse_args() {
             -c|--cipher)       _cli_val "$arg" "$has_val" "$val" "$#" "${2:-}"; _cli_cipher="$_cli_v"; [ "$has_val" = 1 ] || shift ;;
             -b|--bitrate)      _cli_val "$arg" "$has_val" "$val" "$#" "${2:-}"; _cli_bitrate="$_cli_v"; [ "$has_val" = 1 ] || shift ;;
             --exclude-nodes)   _cli_val "$arg" "$has_val" "$val" "$#" "${2:-}"; _cli_exclude="$_cli_v"; [ "$has_val" = 1 ] || shift ;;
+            --dial-attempts)   _cli_val "$arg" "$has_val" "$val" "$#" "${2:-}"; _cli_dial_attempts="$_cli_v"; [ "$has_val" = 1 ] || shift ;;
+            --dial-timeout)    _cli_val "$arg" "$has_val" "$val" "$#" "${2:-}"; _cli_dial_timeout="$_cli_v"; [ "$has_val" = 1 ] || shift ;;
 
             # ── Boolean flags (and their --no- negations) ─────────────────
             --save-secret)     CLI_SAVE_SECRET=1 ;;
@@ -5790,6 +6807,10 @@ parse_args() {
             --single-hop)      _cli_single_hop=1 ;; --no-single-hop)   _cli_single_hop=0 ;;
             --auto-listen)     _cli_auto_listen=1 ;;--no-auto-listen)  _cli_auto_listen=0 ;;
             --show-circuit)    _cli_show_circuit=1 ;;--no-show-circuit) _cli_show_circuit=0 ;;
+
+            --normalize)       _cli_normalize=1 ;; --no-normalize) _cli_normalize=0 ;;
+            --full-duplex)     _cli_fullduplex=1 ;; --no-full-duplex) _cli_fullduplex=0 ;;
+            --start-muted)     _cli_start_muted=1 ;; --no-start-muted) _cli_start_muted=0 ;;
 
             --) shift; break ;;
             -*) echo "Unknown option: $arg" >&2
@@ -5834,6 +6855,12 @@ apply_cli_overrides() {
     [ -n "$_cli_single_hop" ]   && SINGLE_HOP="$_cli_single_hop"
     [ -n "$_cli_auto_listen" ]  && AUTO_LISTEN="$_cli_auto_listen"
     [ -n "$_cli_show_circuit" ] && SHOW_CIRCUIT="$_cli_show_circuit"
+
+    [ -n "$_cli_normalize" ]    && NORMALIZE_PLAYBACK="$_cli_normalize"
+    [ -n "$_cli_fullduplex" ]   && FULL_DUPLEX="$_cli_fullduplex"
+    [ -n "$_cli_start_muted" ]  && START_MUTED="$_cli_start_muted"
+    [ -n "$_cli_dial_attempts" ] && DIAL_ATTEMPTS="$_cli_dial_attempts"
+    [ -n "$_cli_dial_timeout" ]  && DIAL_TIMEOUT="$_cli_dial_timeout"
     if [ "$CLI_SECRET_SET" -eq 1 ]; then
         SHARED_SECRET="$CLI_SECRET"
     fi
@@ -5845,7 +6872,7 @@ apply_cli_overrides() {
 #=============================================================================
 
 # Allow sourcing from test suite without executing main entry point.
-# When sourced (e.g. source /partyline.sh in tests), return 0 here so the
+# When sourced (e.g. source /tor-party-line.sh in tests), return 0 here so the
 # trap, load_config, and main_menu below are never reached.
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] || return 0
 
@@ -5874,8 +6901,20 @@ _data_parent="$(dirname "$DATA_DIR")"
 # Create data directories
 mkdir -p "$DATA_DIR" "$AUDIO_DIR" "$PID_DIR" "$DATA_DIR/run" "$DATA_DIR/relay"
 
-# Clean any stale run files from previous sessions
-overwrite_rm "$DATA_DIR/run/"* 2>/dev/null || true
+# Clean any stale run files left by a crashed instance whose PID got recycled.
+# Every file under run/ is named "*_<pid>"; a bare glob-delete would also wipe
+# the flag/FIFO files of any other instance of this script currently running
+# against the same DATA_DIR, tearing down its live call. Only remove files
+# whose owning PID is not actually running.
+for _stale_f in "$DATA_DIR/run/"*; do
+    [ -e "$_stale_f" ] || continue
+    _stale_pid="${_stale_f##*_}"
+    if [[ "$_stale_pid" =~ ^[0-9]+$ ]] && kill -0 "$_stale_pid" 2>/dev/null; then
+        continue
+    fi
+    overwrite_rm "$_stale_f"
+done
+unset _stale_f _stale_pid
 
 # A CLI-provided secret means we must not block on the interactive passphrase
 # prompt inside load_config — the CLI value overrides the stored one anyway.
@@ -5884,6 +6923,8 @@ overwrite_rm "$DATA_DIR/run/"* 2>/dev/null || true
 # Load saved config, then let CLI flags win over it.
 load_config
 apply_cli_overrides
+
+[ "$NORMALIZE_PLAYBACK" -eq 1 ] && ensure_pcm_rms
 
 # Persist the secret if requested (or implicitly by the `config` command).
 if { [ "$CLI_SAVE_SECRET" -eq 1 ] || [ "$CMD" = "config" ]; } && [ "$CLI_SECRET_SET" -eq 1 ]; then
@@ -5913,6 +6954,10 @@ if [ "$CMD" = "config" ]; then
     echo -e "  Auto-listen   : $AUTO_LISTEN"
     echo -e "  Show circuit  : $SHOW_CIRCUIT"
     echo -e "  Exclude nodes : ${EXCLUDE_NODES:-(none)}"
+
+    echo -e "  Normalize     : $NORMALIZE_PLAYBACK"
+    echo -e "  Full-duplex   : $FULL_DUPLEX"
+    echo -e "  Start muted   : $START_MUTED"
     echo ""
     exit 0
 fi

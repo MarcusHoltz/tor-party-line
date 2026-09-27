@@ -5,9 +5,7 @@ data/
 .torpartyline/
 
 # ─── Secrets & environment ────────────────────────────────────────────────────
-secrets/*
-# keep the dir on clone so Docker's bind mount has a host path; ignore everything inside (incl. the real secret)
-!secrets/.gitkeep
+secrets/
 .env
 .env.*
 # keep the committed template; .env.* above would swallow it without this exception

@@ -1,19 +1,12 @@
 <h1 align="center">🧅 Tor Party Line</h1>
 
 <p align="center">
-  <strong>Encrypted push-to-talk voice & group party line over Tor hidden services.</strong><br>
+  <strong>Encrypted push-to-talk voice &amp; group party line over Tor hidden services.</strong><br>
   No accounts. No phone numbers. No servers. End-to-end encrypted voice over Tor.
 </p>
 
 
 ---
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--tor--tor-party-line-terminal-phone.jpg" alt="Tor Party Line - Know the Onion talk with the Onion" width="760">
-</p>
-
----
-
 
 
 <p align="center">
@@ -31,6 +24,7 @@
   <a href="#-faq">FAQ</a>
 </p>
 
+
 ---
 
 ## 👍 Overview
@@ -38,6 +32,27 @@
 Enjoy the experience of a walkie-talkie over [Tor](https://community.torproject.org/onion-services/overview/). 
 
 Want to talk? Agree on a shared secret — hold a key, speak, release. The other side hears it.
+
+---
+
+
+## The Party Line Trifecta
+
+Three networks, one app. The Party Line ships in triplicate. Same TUI, same encryption. Pick the transport that matches your threat model:
+
+| | | |
+|---|---|---|
+| [![Tor Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--tor-onion-router-overlay-network.jpg)](/#) | [![I2P Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--invisible-internet-project-i2p-garlic-roter.jpg)](https://gitlab.com/MarcusHoltz/i2p-party-line) | [![Reticulum Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--reticulum-network-stack.jpg)](https://gitlab.com/MarcusHoltz/reticulum-party-line) |
+| **Tor Party Line** | [I2P Party Line](https://gitlab.com/MarcusHoltz/i2p-party-line) | [Reticulum Party Line](https://gitlab.com/MarcusHoltz/reticulum-party-line) |
+
+
+<p align="center">
+  <a href="https://gitlab.com/MarcusHoltz/party-line-pager">
+    <img src="https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/posts/party-line-pager--tor-i2p-rns-call-pager.svg" alt="PartylinePager" width="25%">
+  </a>
+</p>
+
+ <img src="https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/posts/party-line-pager--tor-i2p-rns-call-pager.svg" alt="PartylinePager" height="14"> **[PartylinePager](https://gitlab.com/MarcusHoltz/party-line-pager)** completes the suite: **Message** the party line **address** to anyone **subscribed** across **chat** networks Telegram, Matrix, Signal, IRC, XMPP, Mastodon, Email, and more.
 
 
 ---
@@ -50,7 +65,7 @@ Want to talk? Agree on a shared secret — hold a key, speak, release. The other
 Run the script. 
 
 ```bash
-chmod +x partyline.sh && ./partyline.sh
+chmod +x tor-party-line.sh && ./tor-party-line.sh
 ```
 
 
@@ -58,11 +73,27 @@ chmod +x partyline.sh && ./partyline.sh
 
 ### Docker
 
-Run docker interactivly.
+Run docker interactively.
 
 ```bash
 docker compose run --rm partyline
 ```
+
+The container runs as a non-root `partyline` user (uid 1000). The
+entrypoint handles Tor setup, then drops privileges via `setpriv`
+before launching the app.
+
+> **Podman / rootless Docker:** works out of the box. One cosmetic
+> gotcha: without `--userns=keep-id`, bind-mounted files (the
+> `data/` directory) are owned by a subordinate uid on the host
+> (e.g. 100999) instead of your user. The container itself is
+> unaffected. To get host-owned files, pass `--userns=keep-id`:
+>
+> ```bash
+> podman run --rm --userns=keep-id \
+>   -v ./data:/app/data \
+>   <image> tor-party-line.sh
+> ```
 
 
 ---
@@ -88,12 +119,9 @@ docker compose run --rm partyline
   ╔╦╗┌─┐┬─┐  ╔═╗┌─┐┬─┐┌┬┐┬ ┬  ╦  ┬┌┐┌┌─┐
    ║ │ │├┬┘  ╠═╝├─┤├┬┘ │ └┬┘  ║  ││││├┤
    ╩ └─┘┴└─  ╩  ┴ ┴┴└─ ┴  ┴   ╩═╝┴┘└┘└─┘
+             The Onion Router
 
   ───────────────────────────────────────────
-  Encrypted Voice & Group Bridge over Tor
-  ───────────────────────────────────────────
-  v2.0.0 | Push-to-Talk | End-to-End AES-256-CBC
-
   Address: 7g2xq4zd...onion
   Secret: ●  Tor: ●  Snowflake: ●  Auto-listen: ●  PTT: [SPACE]
   ▸ Ready. Press 4 to listen, or 5 to call.
@@ -134,7 +162,7 @@ docker compose run --rm partyline
   Last recv:  --
   Remote:     Idle
 
-   Ready  [SPACE]=Talk [T]=Chat [S]=Set [Q]=Hang up
+   Ready  [SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up
 ```
 
 </td>
@@ -150,7 +178,7 @@ docker compose run --rm partyline
 
   Group:      4 callers
 
-   Ready  [SPACE]=Talk [T]=Chat [S]=Set [Q]=Hang up
+   Ready  [SPACE]=Talk [T]=Chat [S]=Settings [Q]=Hang up
 ```
 
 </td>
@@ -211,6 +239,7 @@ The safest handoff is a one-time link that self-destructs after a single read �
 | **Hold SPACE** | Record; sends on release (hold-to-talk) |
 | **T** | Send encrypted text |
 | **S** | Mid-call settings (fix audio, change push-to-talk) |
+| **M** | Mute/unmute mic (full-duplex only) |
 | **Q** | Hang up |
 
 > **Hold-to-talk:** press SPACE, wait a beat, *then* speak; release to send. 
@@ -240,8 +269,30 @@ Commands: listen | call [ADDR] | relay | status | test | config | install | unin
       --single-hop      Single-hop HS (faster, less anon) (--no-single-hop) [off]
       --auto-listen     Auto-listen after Tor starts    (--no-auto-listen) [off]
       --show-circuit    Show circuit hops in header     (--no-show-circuit)[off]
+      --dial-attempts N Retry initial dial N times                      [3]
+      --dial-timeout N  Per-attempt SOCKS timeout in seconds            [60]
+      --full-duplex    Live bidirectional audio (single-hop) (--no-full-duplex)[off]
+      --start-muted    Begin full-duplex calls muted     (--no-start-muted)[on]
       --save            Persist all supplied options to config
   -h, --help   -V, --version
+```
+
+Full-duplex mode replaces push-to-talk with live bidirectional audio.
+It requires `--single-hop` because standard 3-hop Tor latency is too
+high for continuous streaming. It also requires `python3` and `libopus`
+(the shared library, not just the CLI tools). Half-duplex (walkie-talkie)
+mode is pure shell and has no Python dependency. The dependency installer
+(menu option 9) asks whether you want full-duplex and installs python3
+if you say yes.
+
+By default, full-duplex sessions start muted. Press **[M]** to unmute
+when ready to speak. To start with the mic live, pass `--no-start-muted`
+or toggle in **Settings > f (Start muted)**.
+
+```bash
+# Full-duplex mode (requires --single-hop for tolerable latency)
+docker compose run --rm partyline listen --single-hop --full-duplex --secret 'shhhsecretshere'
+docker compose run --rm partyline call <addr>.onion --single-hop --full-duplex --secret 'shhhsecretshere'
 ```
 
 
@@ -249,14 +300,14 @@ Commands: listen | call [ADDR] | relay | status | test | config | install | unin
 
 ## 🔨 Troubleshooting
 
-Say it isnt so, this script didnt work instantly? Woe is not without effort:
+Say it isn't so, this script didn't work instantly? Woe is not without effort:
 
 
 ---
 
 ### Sharing address + secret
 
-Getting your onion address and secret to someone, securly. Hand them a one-time link that self-destructs after one read. Both sides set the same secret (menu → **1**), then one listens, one calls.
+Getting your onion address and secret to someone, securely. Hand them a one-time link that self-destructs after one read. Both sides set the same secret (menu → **1**), then one listens, one calls.
 
 > Visit: **[yopass.se](https://share.yopass.se)** → paste `onion:` + `secret:`, set a 1-hour expiry, send the link. 
 
@@ -288,6 +339,57 @@ Almost always the wrong input/output device. A device can "open" in a test and s
 ### Tor stuck / address never appears
 
 First bootstrap takes 1–3 min. Script: press **r** to restart Tor. Tor blocked on your network? Enable [Snowflake](https://snowflake.torproject.org/) in Settings → Tor (Script only). Docker: exit (**0**) and re-run `docker compose run --rm partyline`.
+
+
+---
+
+### Call hangs on "Connecting..."
+
+**Symptom:** One client sits at `Connecting... 38s (1/3)` while other
+clients connect to the same relay immediately.
+
+**Cause:** Tor picked a degraded circuit path for the hidden service
+rendezvous. The circuit is alive enough that socat doesn't error, but too
+broken to complete the connection. Circuit quality varies as relays come
+and go.
+
+**What the app does:** Automatically retries up to `DIAL_ATTEMPTS` times
+(default 3), killing socat between attempts to force Tor to build a new
+circuit. Progress shows elapsed time and attempt number. Most connections
+that fail on attempt 1 succeed on attempt 2.
+
+**If all attempts fail:** The peer is probably offline or unreachable. Check
+that their Tor hidden service is running and their `.onion` address is correct.
+
+**Tuning:** `--dial-timeout` controls how long each attempt waits (default
+60s, sized for Tor circuit build timing). `--dial-attempts` controls how many
+retries. Lower timeout = faster feedback loop but risks killing attempts
+that would have succeeded. Persist with `--save`.
+
+
+---
+
+### Docker: Tor refuses to start after `--force-recreate`
+
+**Symptom:** Tor dies immediately with `[err] No, it's still there. Exiting.`
+or `set_options(): Bug: Acting on config options left us in a broken state.`
+
+**Cause:** `docker compose create --force-recreate` creates a new container but
+the bind-mounted `./data/docker/tor` volume keeps a stale `lock` file from the
+previous Tor process. The new Tor instance sees it and refuses to start.
+
+**Fix:** Already handled in `entrypoint.sh` (removes stale lock before
+launching Tor). If you see this error on an older image, rebuild:
+
+```bash
+docker compose build && docker compose run --rm partyline
+```
+
+Or remove the lock manually:
+
+```bash
+rm -f ./data/docker/tor/lock
+```
 
 
 ---
@@ -377,7 +479,7 @@ docker attach <container_id_or_name>
 - Press **Ctrl+P then Ctrl+Q** to detach again without stopping the container.
 - **Ctrl+C** will terminate the process inside the container — use with caution.
 
-> Script usage is identical: `./partyline.sh call <onion> --secret 'shhhsecretshere'`. For more info, see [Configuration & defaults](#config-and-defaults)
+> Script usage is identical: `./tor-party-line.sh call <onion> --secret 'shhhsecretshere'`. For more info, see [Configuration & defaults](#config-and-defaults)
 
 
 ---
@@ -432,7 +534,7 @@ Environment variable take a precedence order:
 **Verify the full pipeline:**
 ```bash
 docker compose run --rm partyline test   # Docker
-./partyline.sh test                       # Script
+./tor-party-line.sh test                       # Script
 ```
 Records 3 s, Opus-encodes, encrypts, decrypts, plays back. Hear yourself = the whole pipeline works. Output shows the backend used (e.g. `Playing back via pw-play`). Probing order: `pw-play` → `paplay` → `aplay -D default`/`pulse` → raw `plughw` (raw last — when PipeWire/PulseAudio owns the card, direct `plughw` hits `EBUSY`).
 
@@ -445,7 +547,7 @@ Or menu → 9 (install dependencies).
 
 **Forcing a specific ALSA device** (headless / bare-ALSA / Docker) — setting these env vars forces ALSA-direct and bypasses the sound server:
 ```bash
-ALSA_DEVICE=plughw:1,0 ./partyline.sh    # Script, inline
+ALSA_DEVICE=plughw:1,0 ./tor-party-line.sh    # Script, inline
 # Docker: set in .env (copy .env.example first)
 ALSA_DEVICE=plughw:0,0        # mic
 ALSA_PLAY_DEVICE=plughw:0,0   # speakers
@@ -492,6 +594,8 @@ Settings precedence (lowest → highest): **built-in defaults → `.env`** (Dock
 | `HEARTBEAT_INTERVAL` | `20` | Keepalive PING interval; keep well below `RELAY_IDLE_TIMEOUT` |
 | `CLIENT_TIMEOUT` | `180` | No inbound traffic this long = dropped; tear down + reconnect |
 | `RECONNECT_ATTEMPTS` | `3` | Silent re-dials after a drop; `0` disables auto-reconnect |
+| `DIAL_ATTEMPTS` | `3` | Retry initial dial this many times before giving up (forces a new Tor circuit on each retry) |
+| `DIAL_TIMEOUT` | `60` | Per-attempt SOCKS connect timeout in seconds; Tor circuit build typically takes 15-60 s |
 | `MAX_PTT_SECONDS` | `120` | Hard cap on one push-to-talk transmission; recorder self-stops at the limit |
 | `MAX_AUDIO_B64` | `524288` | Sender skips an AUDIO blob over this (base64 bytes); backstop to `MAX_PTT_SECONDS` |
 | `MAX_LINE_BYTES` | `524288` | Relay drops any inbound line larger than this before forwarding |
@@ -516,9 +620,11 @@ Settings precedence (lowest → highest): **built-in defaults → `.env`** (Dock
 | `--auto-listen` | `AUTO_LISTEN` | `0` |
 | `--show-circuit` | `SHOW_CIRCUIT` | `0` |
 | `--exclude-nodes` | `EXCLUDE_NODES` | *(none)* |
+| `--dial-attempts` | `DIAL_ATTEMPTS` | `3` |
+| `--dial-timeout` | `DIAL_TIMEOUT` | `60` |
 | `-s, --secret` | *(use Docker secret — see below)* | — |
 
-Audio (`ALSA_DEVICE`, `ALSA_PLAY_DEVICE`, `PULSE_SOURCE`, `PULSE_SINK`, `XDG_RUNTIME_DIR`), keep-alive tuning (`RELAY_IDLE_TIMEOUT`, `HEARTBEAT_INTERVAL`, `CLIENT_TIMEOUT`, `RECONNECT_ATTEMPTS`), and the anti-flood limits (`MAX_PTT_SECONDS`, `MAX_AUDIO_B64`, `MAX_LINE_BYTES`, `MAX_MSG_B64`, `RELAY_MAX_MSG_PER_SEC`, `RELAY_MAX_INFLIGHT`, `RELAY_WRITE_TIMEOUT`) are also `.env`-settable — see `.env.example`.
+Audio (`ALSA_DEVICE`, `ALSA_PLAY_DEVICE`, `PULSE_SOURCE`, `PULSE_SINK`, `XDG_RUNTIME_DIR`), keep-alive tuning (`RELAY_IDLE_TIMEOUT`, `HEARTBEAT_INTERVAL`, `CLIENT_TIMEOUT`, `RECONNECT_ATTEMPTS`), dial retry (`DIAL_ATTEMPTS`, `DIAL_TIMEOUT`), and the anti-flood limits (`MAX_PTT_SECONDS`, `MAX_AUDIO_B64`, `MAX_LINE_BYTES`, `MAX_MSG_B64`, `RELAY_MAX_MSG_PER_SEC`, `RELAY_MAX_INFLIGHT`, `RELAY_WRITE_TIMEOUT`) are also `.env`-settable — see `.env.example`.
 
 </details>
 
@@ -651,11 +757,11 @@ All three files (`hostname`, `hs_ed25519_public_key`, `hs_ed25519_secret_key`) m
 <br>
 
 ```bash
-chmod +x partyline.sh
-./partyline.sh
+chmod +x tor-party-line.sh
+./tor-party-line.sh
 ```
 
-Auto-detects your platform and offers to install dependencies via your package manager (you're asked before anything is installed). Undo everything with `./partyline.sh uninstall`.
+Auto-detects your platform and offers to install dependencies via your package manager (you're asked before anything is installed). Undo everything with `./tor-party-line.sh uninstall`.
 
 | Platform | Package manager | Audio |
 |----------|----------------|-------|
@@ -754,7 +860,7 @@ A **Custom** option lets you enter any combination of country codes in Tor forma
 
 **CLI:**
 ```bash
-./partyline.sh --exclude-nodes '{US},{GB},{CA},{AU},{NZ}'
+./tor-party-line.sh --exclude-nodes '{US},{GB},{CA},{AU},{NZ}'
 ```
 
 **`.env` (Docker):**
@@ -784,7 +890,7 @@ EXCLUDE_NODES={US},{GB},{CA},{AU},{NZ},{DK},{FR},{NL},{NO}
 
 | Property | Notes |
 |----------|-------|
-| **Encryption** | AES-256-CBC + [PBKDF2](https://datatracker.ietf.org/doc/html/rfc8018) (100k iterations). 21 cipher options (AES/Camellia/ARIA in CBC/CTR/CFB/OFB + ChaCha20). No AEAD/GCM — [`openssl enc`](https://www.openssl.org/docs/man3.0/man1/openssl-enc.html) can't stream them. |
+| **Encryption** | AES-256-CBC + [PBKDF2](https://datatracker.ietf.org/doc/html/rfc8018) (10k iterations for audio, 100k for secret-at-rest). 21 cipher options: AES in CBC/CTR/CFB/OFB, Camellia and ARIA in CBC/CTR, plus ChaCha20. No AEAD/GCM ([`openssl enc`](https://www.openssl.org/docs/man3.0/man1/openssl-enc.html) can't stream them). |
 | **Secret storage** | Shared secret encrypted at rest; passphrase required to load. |
 | **HMAC signing** | Optional. Cryptographically signs every protocol message; prevents replay attacks. |
 | **Overwrite before delete** | Optional (Settings → Security). Random-overwrites every temp file (recordings, chunks, payloads, nonce logs) before deletion. **SSD caveat:** wear-leveling defeats this — full-disk encryption ([LUKS](https://gitlab.com/cryptsetup/cryptsetup)/[FileVault](https://support.apple.com/en-us/102650)) is the only reliable defense against physical recovery. |
@@ -844,18 +950,18 @@ Base64 ──▶ socat ──▶ Tor ──▶ socat ──▶ Receive
 docker compose run --rm partyline
         │
         ▼
-[entrypoint.sh]  (root)
+[docker/entrypoint.sh]  (runs as root, then drops privileges)
   1. Fix /var/lib/tor permissions (chown debian-tor:debian-tor)
   2. Generate /tmp/partyline.torrc from saved config
   3. tor -f torrc &  (User debian-tor → drops privileges on start)
   4. Wait for "Bootstrapped 100%"
   5. Wait for hidden_service/hostname
-  6. exec /partyline.sh
+  6. exec setpriv --reuid=partyline --regid=partyline /tor-party-line.sh
         │
         ▼
-[partyline.sh]  (interactive TTY required)
+[tor-party-line.sh]  (interactive TTY required)
   Codec:    opusenc / opusdec  (8 kHz, 16 kbps, speech)
-  Encrypt:  openssl enc aes-256-cbc -pbkdf2 -iter 100000
+  Encrypt:  openssl enc aes-256-cbc -pbkdf2 -iter 10000
   HMAC:     openssl dgst -sha256 -hmac  (optional)
   Transport: socat SOCKS4A:127.0.0.1:9050 (outbound via Tor)
              socat TCP-LISTEN:7777        (inbound)
@@ -866,30 +972,38 @@ docker compose run --rm partyline
   ./data/docker/partyline (bind mount) → /data/.partyline   (encrypted secret, config, FIFOs)
 ```
 
-**Code map** — all logic lives in `partyline.sh` (5 597 lines total):
+**Code map** -- all logic lives in `tor-party-line.sh` (5 988 lines, 134 functions):
 
 | Lines | Contents |
 |-------|---------|
-| 1–153 | Config globals, Docker/script detection, color codes, platform & Homebrew setup |
-| 154–508 | Core helpers: logging, config load/save, dep check, package-manager wrappers (`_pm_init`, `pm_install`, …) |
-| 509–659 | Audio backend detection (`detect_audio_backend`, `_server_available`, ALSA probes) |
-| 660–942 | Dependency install/uninstall (`install_deps`, `uninstall_all`) |
-| 943–1246 | Tor management: `setup_tor`, `install_snowflake`, `_tor_spawn/wait`, `start/stop_tor`, `rotate_onion` |
-| 1247–1566 | Vanity onion, Docker Tor restart, country codes, circuit hops (`generate_vanity_onion`, `get_circuit_hops`) |
-| 1567–1758 | Secrets, cipher helpers, encryption, HMAC protocol signing (`encrypt_file`, `proto_send`/`proto_verify`) |
-| 1759–2053 | Audio pipeline: record, play, PTT send/stop (`_record_raw`, `_play_with`, `stop_and_send`, `play_chunk`) |
-| 2054–2568 | Call infrastructure: cleanup, auto-listener, wakelock, `listen_for_call`, `_dial_remote`, `call_remote` |
-| 2569–2983 | Relay mode, call header drawing, circuit refresh (`relay_mode`, `broadcast_count`, `draw_call_header`) |
-| 2984–3426 | `in_call_session` — PTT event loop, receive handler, mid-call settings |
-| 3427–3656 | `test_audio`, `show_status` |
-| 3657–4152 | Audio device menus: picker, Android flow, noise generator, output tester, diagnostics, `audio_menu` |
-| 4153–4867 | Settings menus: Opus, PTT, Tor, ports, single-hop, country exclusions (`settings_menu` + sub-menus) |
-| 4868–5043 | Security settings: HMAC, overwrite-on-delete (`settings_security`, `settings_hmac`, `settings_overwrite_delete`) |
-| 5044–5310 | Banner and main menu (`show_banner`, `main_menu`) |
-| 5312–5488 | CLI interface: `print_cli_help`, `parse_args`, `_cli_getval`, `apply_cli_overrides` |
-| 5489–5597 | Entry point: bootstrap, dep check, Tor start, command dispatch |
+| 1-189 | Config globals, Docker/script detection, color codes, platform & Homebrew setup |
+| 190-520 | Core helpers: logging, config load/save, dep check, package-manager wrappers (`_pm_init`, `pm_install`, ...) |
+| 521-779 | Audio backend detection (`detect_audio_backend`, `_server_available`, ALSA probes) |
+| 780-1052 | Dependency install/uninstall (`install_deps`, `uninstall_all`) |
+| 1053-1359 | Tor management: `setup_tor`, `install_snowflake`, `_tor_spawn/wait`, `start/stop_tor`, `rotate_onion` |
+| 1360-1651 | Vanity onion, Docker Tor restart, country codes, circuit hops (`generate_vanity_onion`, `get_circuit_hops`) |
+| 1652-1916 | Secrets, cipher helpers, encryption, HMAC protocol signing (`encrypt_file`, `proto_send`/`proto_verify`) |
+| 1917-2310 | Audio pipeline: record, play, PTT send/stop (`_record_raw`, `_play_with`, `stop_and_send`, `play_chunk`) |
+| 2311-2824 | Call infrastructure: cleanup, auto-listener, wakelock, `listen_for_call`, `_dial_remote`, `call_remote` |
+| 2825-3109 | Relay mode, call header drawing, circuit refresh (`relay_mode`, `broadcast_count`, `draw_call_header`) |
+| 3110-3777 | `in_call_session` -- PTT event loop, receive handler, mid-call settings |
+| 3778-4023 | `test_audio`, `show_status` |
+| 4024-4623 | Audio device menus: picker, Android flow, noise generator, output tester, diagnostics, `audio_menu` |
+| 4624-5063 | Settings menus: Opus, PTT, Tor, ports, single-hop, country exclusions (`settings_menu` + sub-menus) |
+| 5064-5421 | Boolean toggle engine, security settings: HMAC, overwrite-on-delete (`settings_security`, `settings_hmac`, `settings_overwrite_delete`) |
+| 5422-5680 | Banner and main menu (`show_banner`, `main_menu`) |
+| 5681-5852 | CLI interface: `print_cli_help`, `parse_args`, `_cli_val`, `apply_cli_overrides` |
+| 5853-5988 | Entry point: bootstrap, dep check, Tor start, command dispatch |
 
-`entrypoint.sh` is Docker-only: sets `/var/lib/tor` permissions, generates `torrc`, starts Tor as `debian-tor`, waits for bootstrap, then `exec`s `partyline.sh`.
+`docker/entrypoint.sh` is Docker-only: sets `/var/lib/tor` permissions, generates `torrc`, starts Tor as `debian-tor`, waits for bootstrap, then drops to the non-root `partyline` user (uid 1000) via `setpriv` and `exec`s `tor-party-line.sh`.
+
+**`docker/` folder:**
+
+| File | Purpose |
+|------|---------|
+| `entrypoint.sh` | Tor setup + privilege drop (baked into the image at build time) |
+| `hooks/audit-pins.sh` | CI-only: validates Dockerfile digest and version pins |
+| `hooks/update-pins.sh` | CI-only: checks for newer base images and pip versions |
 
 </details>
 
@@ -914,7 +1028,7 @@ Tor latency and bandwidth make full-duplex unreliable. PTT sends a complete clip
 None. Your identity is your `.onion` address; authentication is the shared secret.
 
 **How do I audit it?**
-Read `partyline.sh` — one Bash file, [code map](#-architecture) above. No binaries, no telemetry, no network calls except via Tor.
+Read `tor-party-line.sh` — one Bash file, [code map](#-architecture) above. No binaries, no telemetry, no network calls except via Tor.
 
 **Tor is blocked on my network.**
 Enable [Snowflake](#snowflake) (Script only).
@@ -934,13 +1048,75 @@ Here are some other related projects:
 
 | Tool | Hides IP | No account | Voice | Group | Notes |
 |------|:---:|:---:|:---:|:---:|------|
-| **🧅 Tor Party Line** | ✅ Tor | ✅ | ✅ PTT | ✅ | Terminal, single script; half-duplex |
+| **🧅 Tor Party Line** | ✅ Tor | ✅ | ✅ PTT | ✅ | Terminal, single script; PTT default; full-duplex with --single-hop |
 | [Mumble](https://www.mumble.info/) | ❌ | ✅ | ✅ full-duplex | ✅ | Low-latency, required software |
 | [Jami](https://jami.net/) | ⚠️ P2P | ✅ | ✅ full-duplex | ✅ | Serverless GUI; metadata via DHT |
 | [Briar](https://briarproject.org/) | ✅ Tor | ✅ | ❌ | ✅ | Tor messaging, no voice |
 | [Cwtch](https://cwtch.im/) | ✅ Tor | ✅ | ❌ | ✅ | Metadata-resistant text, no voice |
 | [Signal](https://signal.org/) | ❌ | ❌ | ✅ full-duplex | ✅ | Great E2EE; needs a phone number |
 | [OnionShare](https://onionshare.org/) | ✅ Tor | ✅ | ❌ | ⚠️ | Tor files + chat, not voice |
+
+
+---
+
+## 🔐 Security Audit Notes
+
+Audited 2026-09-03. No critical issues found. The script uses
+sound security practices throughout.
+
+### Positive findings
+
+- **No `eval` or `source`**: the script never executes
+  dynamically constructed code or sources external files.
+- **Secret handling via fd:3**: the room secret is passed to
+  `openssl` through a here-string on file descriptor 3, never
+  as a CLI argument (which would leak into `/proc/*/cmdline`).
+- **Restrictive file permissions**: sensitive files (FIFO pipes,
+  secret storage, relay keys) are protected with `chmod 600`
+  after creation.
+- **HMAC authentication**: every voice packet is signed with
+  `openssl dgst -sha256 -hmac` using a nonce and replay
+  detection via sequence numbers. Packets with invalid or
+  replayed signatures are silently dropped.
+- **No secrets on the command line**: secrets are passed to
+  `openssl` via here-strings on fd:3 (`3<<< "$SECRET"`),
+  never as CLI arguments (which would leak into `ps` output
+  and `/proc/*/cmdline`).
+- **No credential leakage**: connection strings, secrets, and
+  keys are never logged, echoed, or written to world-readable
+  paths.
+
+### Low-severity observations
+
+- **HMAC timing**: `openssl dgst` comparison uses a string
+  equality check, which is theoretically vulnerable to timing
+  side-channels. Practically unexploitable over Tor (latency
+  jitter dwarfs any timing signal), but noted for completeness.
+- **FIFO permissions**: named pipes are created with default
+  umask, then `chmod 600` is applied. A brief window exists
+  between creation and chmod. Mitigated by the script running
+  inside a container with no other users.
+
+### Cross-repo relationship
+
+Three sibling projects share approximately 80% of their code
+(~4,600 lines, 109 of 134 functions are identical):
+
+| Project | Transport | Key difference |
+|---------|-----------|----------------|
+| **Tor Party Line** *(this)* | Tor hidden services | Trusted relay (secret written to relay host) |
+| [I2P Party Line](https://github.com/MarcusHoltz/i2p-party-line) | i2pd tunnels | Untrusted relay (secret discarded after setup) |
+| [Reticulum Party Line](https://github.com/MarcusHoltz/reticulum-party-line) | RNS bridge | Untrusted relay, Python bridge for Reticulum mesh |
+
+Shared code covers: room lifecycle, audio capture/playback,
+HMAC signing, encryption, PTT handling, the TUI, configuration,
+and all user-facing features. Transport-specific code (Tor
+hidden service management, onion address generation,
+`EXCLUDE_NODES`, `SNOWFLAKE_ENABLED`) lives only in this repo.
+
+When a shared function changes in one script, the same change
+is applied to the other two, adapted for transport-specific
+naming where needed.
 
 
 ---

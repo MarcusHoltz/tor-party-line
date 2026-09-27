@@ -4,11 +4,23 @@ services:
     container_name: tor-party-line
     restart: unless-stopped
     stdin_open: true   # Required: PTT loop uses stty raw -echo -icanon; also keeps stdin open for relay daemon
+    tty: true          # Required: stty, ANSI escapes, and read -rsn1 need a pseudo-TTY
     security_opt:
-      - label:disable   # SELinux (Fedora/RHEL): runs the container as spc_t (unconfined) — no type-enforcement
+      - label:disable   # SELinux (Fedora/RHEL): runs the container as spc_t (unconfined) - no type-enforcement
                         # checks apply, so the container can access the user_tmp_t PulseAudio socket AND read
                         # the Docker-secrets file (user_home_t) without needing selinux: z on either mount.
                         # Silently ignored on non-SELinux systems (Debian, Arch, macOS).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+      - SETGID
+      - SETUID
+    group_add:
+      - audio
     devices:
       - /dev/snd:/dev/snd  # ALSA direct hardware passthrough
     volumes:
@@ -74,7 +86,7 @@ services:
 #
 # ─── Audio: Script vs Docker ─────────────────────────────────────────────────
 #
-#  Script (./partyline.sh): audio prefers the system sound server via
+#  Script (./tor-party-line.sh): audio prefers the system sound server via
 #    parecord/paplay (which talk to both PulseAudio and PipeWire), honoring
 #    the input/output you selected in your desktop sound settings. This is the
 #    reliable path on multi-soundcard desktops — pick devices via the in-app
@@ -102,6 +114,6 @@ services:
 #
 # ─ Running via the Script (macOS / Android / Linux without Docker) ─────────
 #
-#  ./partyline.sh               # Self-detects platform, installs deps, manages Tor
+#  ./tor-party-line.sh               # Self-detects platform, installs deps, manages Tor
 #
 # ─────────────────────────────────────────────────────────────────────────────

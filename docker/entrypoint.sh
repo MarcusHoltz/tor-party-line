@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tor Party Line — Container Entrypoint
 # Generates torrc from saved config, starts Tor as 'debian-tor' user (the reliable way),
-# waits for bootstrap, then execs partyline.sh.
+# waits for bootstrap, then execs tor-party-line.sh.
 #
 # Uses the exact permission+user pattern that makes Tor start reliably in Docker.
 
@@ -47,10 +47,12 @@ mkdir -p /data/.partyline/pids \
          /data/.partyline/audio \
          /data/.partyline/run \
          /data/.partyline/relay
+chown partyline:partyline /data 2>/dev/null || true
+chown -R partyline:partyline /data/.partyline
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Generate torrc dynamically from saved config
-#    This replicates what partyline.sh's setup_tor() + start_tor() does:
+#    This replicates what tor-party-line.sh's setup_tor() + start_tor() does:
 #    reading current settings and writing a fresh torrc each startup.
 #    Ensures ExcludeNodes, SINGLE_HOP, SHOW_CIRCUIT all take effect correctly.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,8 +161,8 @@ MaxClientCircuitsPending 32
 KeepalivePeriod 60 seconds
 HeartbeatPeriod 30 minutes
 
-# ── Control port (for circuit display in partyline.sh) ───────────────────────
-# Always enabled — partyline.sh reads /var/lib/tor/control_auth_cookie
+# ── Control port (for circuit display in tor-party-line.sh) ───────────────────────
+# Always enabled — tor-party-line.sh reads /var/lib/tor/control_auth_cookie
 ControlPort 127.0.0.1:9051
 CookieAuthentication 1
 
@@ -186,7 +188,7 @@ if [ "${SNOWFLAKE_ENABLED:-0}" = "1" ]; then
     echo "" >&2
     echo "┌─────────────────────────────────────────────────────┐" >&2
     echo "│ WARNING: Snowflake is not supported in Docker mode  │" >&2
-    echo "│ Run partyline.sh on the host to use Snowflake        │" >&2
+    echo "│ Run tor-party-line.sh on the host to use Snowflake        │" >&2
     echo "└─────────────────────────────────────────────────────┘" >&2
     echo "" >&2
 fi
@@ -205,6 +207,7 @@ chmod 644 "$TORRC"
 # in the torrc. Do NOT redirect stdout/stderr here — that would conflict.
 touch /tmp/tor-bootstrap.log
 chown debian-tor:debian-tor /tmp/tor-bootstrap.log
+rm -f /var/lib/tor/lock
 tor -f "$TORRC" &
 _TOR_BG=$!
 
@@ -264,9 +267,17 @@ else
     printf "[!] Hostname not yet written — partyline will show 'pending'\n\n" >&2
 fi
 
+# Tor enforces 700 on /var/lib/tor at startup. Now that Tor is running, open
+# group access so the partyline user (in the debian-tor group) can read the
+# hostname and write vanity keys into hidden_service/.
+chmod 710 /var/lib/tor
+chmod 770 /var/lib/tor/hidden_service
+chmod 640 /var/lib/tor/hidden_service/hostname 2>/dev/null || true
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Exec into partyline.sh
-#    `exec` replaces this shell so partyline.sh receives signals directly.
-#    Tor continues running as a background process (not a child of partyline.sh).
+# 7. Exec into tor-party-line.sh
+#    `exec` replaces this shell so tor-party-line.sh receives signals directly.
+#    Tor continues running as a background process (not a child of tor-party-line.sh).
 # ─────────────────────────────────────────────────────────────────────────────
-exec /partyline.sh "$@"
+exec setpriv --reuid=partyline --regid=partyline \
+     --init-groups /tor-party-line.sh "$@"

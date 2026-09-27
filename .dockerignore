@@ -10,6 +10,11 @@
 *.swo
 *~
 
+# ─── CI/CD (not needed inside the image) ─────────────────────────────────────
+.github/
+.gitlab-ci.yml
+docker/hooks/
+
 # ─── Docker / compose files (not needed inside the image) ────────────────────
 docker-compose.yml
 docker-compose.override.yml
@@ -22,6 +27,11 @@ secrets/
 .env.*
 *.env
 
+# ─── Tor key material ────────────────────────────────────────────────────────
+hs_ed25519_secret_key
+hs_ed25519_public_key
+**/hidden_service/
+
 # ─── Project runtime data (created at container run time, not build time) ──────
 data/
 # Script-mode runtime dir: Tor hidden-service keys, shared_secret, torrc, pids.
@@ -29,6 +39,7 @@ data/
 
 # ─── Docs / misc (not needed in image) ───────────────────────────────────────
 README*
+README-hub.md
 LICENSE
 *.md
 
@@ -39,7 +50,6 @@ Thumbs.db
 # ─── AI / LLM tool directories ───────────────────────────────────────────────
 .claude/
 .openai/
-.github/copilot/
 .copilot/
 .cursor/
 .cursorignore
