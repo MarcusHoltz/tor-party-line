@@ -1,7 +1,11 @@
-[![Built for Tor](https://img.shields.io/badge/built%20for-Tor-7d4698?style=for-the-badge)](https://www.torproject.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](https://gitlab.com/MarcusHoltz/tor-party-line/-/blob/main/LICENSE)
-[![Source: GitLab](https://img.shields.io/badge/source-GitLab-orange?style=for-the-badge&logo=gitlab)](https://gitlab.com/MarcusHoltz/tor-party-line)
-[![Source: GitHub](https://img.shields.io/badge/source-GitHub-black?style=for-the-badge&logo=github)](https://github.com/MarcusHoltz/tor-party-line)
+<a href="https://gitlab.com/MarcusHoltz/tor-party-line"><img src="https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--tor-onion-router-overlay-network.jpg" alt="Tor Party Line"></a>
+
+<table><tr>
+<td><a href="https://www.torproject.org/"><img src="https://img.shields.io/badge/built%20for-Tor-7d4698?style=for-the-badge" alt="Built for Tor"></a></td>
+<td><a href="https://gitlab.com/MarcusHoltz/tor-party-line/-/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="License: MIT"></a></td>
+<td><a href="https://gitlab.com/MarcusHoltz/tor-party-line"><img src="https://img.shields.io/badge/source-GitLab-orange?style=for-the-badge&logo=gitlab" alt="Source: GitLab"></a></td>
+<td><a href="https://github.com/MarcusHoltz/tor-party-line"><img src="https://img.shields.io/badge/source-GitHub-black?style=for-the-badge&logo=github" alt="Source: GitHub"></a></td>
+</tr></table>
 
 # marcusholtz/tor-party-line
 
@@ -169,11 +173,10 @@ aplay -l      # find playback devices on the host
 
 Three networks, same app, same encryption:
 
-| Project | Transport | Image |
-| --- | --- | --- |
-| **Tor Party Line** | Tor hidden services | [`marcusholtz/tor-party-line`](https://hub.docker.com/r/marcusholtz/tor-party-line) |
-| I2P Party Line | I2P garlic routing | [`marcusholtz/i2p-party-line`](https://hub.docker.com/r/marcusholtz/i2p-party-line) |
-| Reticulum Party Line | Reticulum mesh | [`marcusholtz/reticulum-party-line`](https://hub.docker.com/r/marcusholtz/reticulum-party-line) |
+| | | |
+|---|---|---|
+| [![Tor Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--tor-onion-router-overlay-network.jpg)](https://hub.docker.com/r/marcusholtz/tor-party-line) | [![I2P Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--invisible-internet-project-i2p-garlic-roter.jpg)](https://hub.docker.com/r/marcusholtz/i2p-party-line) | [![Reticulum Party Line](https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/header/header--partyline--reticulum-network-stack.jpg)](https://hub.docker.com/r/marcusholtz/reticulum-party-line) |
+| **Tor Party Line** | [I2P Party Line](https://hub.docker.com/r/marcusholtz/i2p-party-line) | [Reticulum Party Line](https://hub.docker.com/r/marcusholtz/reticulum-party-line) |
 
 ## License
 

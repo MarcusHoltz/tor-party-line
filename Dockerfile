@@ -81,5 +81,6 @@ COPY --chown=partyline:partyline tor-party-line.sh /
 RUN chmod +x /entrypoint.sh /tor-party-line.sh
 
 ENV LANG=C.UTF-8
+ENV DOCKER_MODE=1
 
 ENTRYPOINT ["/entrypoint.sh"]

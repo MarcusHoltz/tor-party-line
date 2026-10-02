@@ -27,11 +27,10 @@ BASE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 
 # ─── Docker mode detection ────────────────────────────────────────────────────
 # MUST come before path assignments so all derived paths use the correct DATA_DIR.
-# When /.dockerenv exists, Tor is managed by entrypoint.sh — skip dep install
-# and Tor management, use container-local paths.
+# DOCKER_MODE=1 is set by the docker Dockerfile (ENV). When active, Tor is
+# managed by entrypoint.sh; skip dep install, use container-local paths.
 # When DOCKER_MODE=0 (script mode), full original behavior on any platform.
-DOCKER_MODE=0
-[ -f /.dockerenv ] && DOCKER_MODE=1
+DOCKER_MODE="${DOCKER_MODE:-0}"
 
 if [ $DOCKER_MODE -eq 1 ]; then
     DATA_DIR="/data/.partyline"
@@ -40,7 +39,7 @@ if [ $DOCKER_MODE -eq 1 ]; then
     ONION_FILE="/var/lib/tor/hidden_service/hostname"
     TOR_SOCKS_PORT=9050                 # fixed in entrypoint-generated torrc
 else
-    DATA_DIR="$BASE_DIR/data/script"
+    DATA_DIR="${DATA_DIR:-$BASE_DIR/data/script}"
     TOR_DIR="$DATA_DIR/tor_data"
     TOR_CONF="$DATA_DIR/torrc"
     ONION_FILE="$TOR_DIR/hidden_service/hostname"
@@ -301,6 +300,11 @@ overwrite_rm() {
 }
 
 cleanup() {
+    # Capture the exit status before any command clobbers it. `set -e` aborts
+    # on the first failed command, then this trap still runs — so without this
+    # the failure is reported to the user as a successful shutdown.
+    local _exit_status=$?
+
     # Restore terminal
     if [ -n "$ORIGINAL_STTY" ]; then
         stty "$ORIGINAL_STTY" 2>/dev/null || true
@@ -314,7 +318,11 @@ cleanup() {
     overwrite_rm "$PTT_FLAG" "$CONNECTED_FLAG" "$MENU_FLAG" "$RECV_PIPE" "$SEND_PIPE"
     overwrite_rm -r "$AUDIO_DIR"
 
-    echo -e "\n${GREEN}${APP_NAME} shut down cleanly.${NC}"
+    if [ "$_exit_status" -eq 0 ]; then
+        echo -e "\n${GREEN}${APP_NAME} shut down cleanly.${NC}"
+    else
+        echo -e "\n${RED}${APP_NAME} exited with error (status $_exit_status).${NC}"
+    fi
 }
 
 kill_bg_processes() {

@@ -98,6 +98,78 @@ before launching the app.
 
 ---
 
+### Immutable distros (Bazzite, Silverblue, SteamOS, etc.)
+
+If you're on an immutable or atomic Linux distro, use
+[Distrobox](https://distrobox.it/) instead of Docker. Your mic,
+speakers, and network are shared with the container automatically.
+
+```bash
+distrobox create --image debian:trixie --name partyline-tor
+distrobox enter partyline-tor
+```
+
+Once inside, grab the script and run it. First run installs
+dependencies (one-time, takes ~1 min):
+
+```bash
+curl -LO https://gitlab.com/MarcusHoltz/tor-party-line/-/raw/main/tor-party-line.sh
+chmod +x tor-party-line.sh && ./tor-party-line.sh
+```
+
+A ready-to-go image with everything pre-installed is also available
+from Docker Hub, GHCR, or GitLab CR:
+
+```bash
+# Docker Hub
+distrobox create --image marcusholtz/tor-party-line-box:latest --name partyline-tor
+
+# GitHub Container Registry
+distrobox create --image ghcr.io/marcusholtz/tor-party-line-box:latest --name partyline-tor
+
+# GitLab Container Registry
+distrobox create --image registry.gitlab.com/marcusholtz/tor-party-line/box:latest --name partyline-tor
+```
+
+Then enter and run:
+
+```bash
+distrobox enter partyline-tor
+tor-party-line.sh
+```
+
+> A `distrobox.ini` file is included in the repo for one-command
+> setup: `distrobox assemble create --file distrobox.ini`
+
+#### Where distrobox keeps your data
+
+The distrobox image stores persistent state in the XDG data directory on
+your **host** filesystem, following the same convention as Universal Blue
+images:
+
+```
+~/.local/share/tor-party-line/
+├── config          saved options
+├── shared_secret   pre-shared secret (chmod 600)
+└── tor_data/       Tor DataDirectory
+    └── hidden_service/   your .onion keys — do not delete
+```
+
+Distrobox bind-mounts your home, so this path is a real directory on your
+disk, not a container layer. Your `.onion` address survives
+`distrobox rm` and container replacement, and travels with your home
+directory if you move it to another machine. Back it up.
+
+Nothing is written to the container image itself, so upgrading the image
+leaves your identity untouched. Override the location with `DATA_DIR`:
+
+```bash
+DATA_DIR=/mnt/secure/tor-party-line tor-party-line.sh
+```
+
+
+---
+
 ### On first run
 
 1. ⏳ Tor bootstraps — 1–3 min (progress shown on screen)
