@@ -12,7 +12,7 @@
 # -- Stage 1: compile pcm_rms ----------------------------------------
 FROM debian:trixie-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev \
+    gcc libc6-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN printf '%s\n' \
     '#include <stdio.h>' \
@@ -37,6 +37,27 @@ RUN printf '%s\n' \
     '    return 0;' \
     '}' > /tmp/pcm_rms.c \
     && gcc -O2 -o /tmp/pcm_rms /tmp/pcm_rms.c -lm
+
+# Application menu entry. The icon is fetched at build time. A failed fetch
+# prints a warning and falls back to a theme icon, it never fails the build.
+RUN mkdir -p /out/usr/share/icons/hicolor/192x192/apps /out/usr/share/applications \
+    && ICON_NAME=audio-headset \
+    && if curl -fsSL --retry 3 --max-time 30 -o /tmp/icon.png \
+        "https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/posts/tor-party-line--avatar.png" \
+        && [ "$(head -c 8 /tmp/icon.png | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ]; then \
+            install -Dm644 /tmp/icon.png /out/usr/share/icons/hicolor/192x192/apps/tor-party-line.png \
+            && ICON_NAME=tor-party-line; \
+        else \
+            printf '%s\n' \
+                '************************************************************' \
+                'WARNING: could not fetch a valid PNG icon from:' \
+                '  https://raw.githubusercontent.com/MarcusHoltz/marcusholtz.github.io/refs/heads/main/assets/img/posts/tor-party-line--avatar.png' \
+                'Building WITHOUT the custom icon. The menu entry will use' \
+                'the generic theme icon "audio-headset".' \
+                '************************************************************' >&2; \
+        fi \
+    && printf '[Desktop Entry]\nType=Application\nName=Tor Party Line\nComment=Encrypted push-to-talk voice and group party line over Tor hidden services\nExec=tor-party-line.sh\nIcon=%s\nTerminal=true\nCategories=Network;Chat;\n' "$ICON_NAME" \
+        > /out/usr/share/applications/tor-party-line.desktop
 
 # -- Stage 2: runtime ------------------------------------------------
 FROM debian:trixie-slim
@@ -63,6 +84,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/pcm_rms /usr/local/bin/pcm_rms
+COPY --from=builder /out/ /
 
 RUN mkdir -p /usr/local/lib/partyline
 COPY tor-party-line.sh /usr/local/lib/partyline/tor-party-line.sh

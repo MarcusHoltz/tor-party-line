@@ -118,6 +118,7 @@ jobs:
             command -v socat
             command -v openssl
             command -v pcm_rms
+            test -f /usr/share/applications/tor-party-line.desktop
             echo "box-smoke-ok"
           '
 
